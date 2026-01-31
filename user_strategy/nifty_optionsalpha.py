@@ -10,7 +10,7 @@ A momentum-based options buying strategy that:
 5. Manages position locally with target/SL
 
 Author: Generated with Claude
-Version: 2.0 (WebSocket)
+Version: 2.1 (WebSocket + Holiday Check)
 """
 
 import time
@@ -22,48 +22,72 @@ from collections import deque
 import pandas as pd
 from openalgo import api
 
+
 # =============================================================================
-# CONFIGURATION - Modify these as needed
+# USER CONFIGURATION - EDIT THESE VALUES
 # =============================================================================
+
+# OpenAlgo API Key (get from http://127.0.0.1:5000/apikey)
+API_KEY = "5901954d90a7aeb2339a374cc2cfb8a3e868c8c61cbdddc5c7b89b3d8c84d562"
+
+# OpenAlgo Server
+HOST = "http://127.0.0.1:5000"
+WS_URL = "ws://127.0.0.1:8765"
+
+# Index to trade
+INDEX = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
+
+# Expiry week (1 = current week, 2 = next week, etc.)
+EXPIRY_WEEK = 1
+
+# Capital & Position Sizing
+CAPITAL_PERCENT = 0.80             # Use 80% of available capital
+
+# Risk Management
+SL_PERCENT = 0.05                  # 5% stop loss below entry level
+TARGET_MULTIPLIER = 2.80           # 180% profit target (entry * 2.80)
+
+# Trailing SL
+TRAIL_TRIGGER_PERCENT = 0.20       # Move SL to cost at 20% profit
+TRAIL_RATIO = 1.0                  # 1:1 trailing after trigger
+
+# Trading Limits
+MAX_TRADES_PER_DAY = 2
+
+# =============================================================================
+
 
 @dataclass
 class Config:
-    """Strategy configuration parameters"""
+    """Strategy configuration - uses top-level constants as defaults"""
 
-    # OpenAlgo Settings
-    API_KEY: str = "your_openalgo_api_key"
-    HOST: str = "http://127.0.0.1:5000"
-    WS_URL: str = "ws://127.0.0.1:8765"
+    # OpenAlgo Settings (from top-level config)
+    API_KEY: str = API_KEY
+    HOST: str = HOST
+    WS_URL: str = WS_URL
 
-    # Index Settings (scalable - add more indices later)
-    INDEX: str = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
-    INDEX_EXCHANGE: str = "NSE_INDEX"       # NSE_INDEX, BSE_INDEX
-    OPTIONS_EXCHANGE: str = "NFO"           # NFO, BFO
-    STRIKE_INTERVAL: int = 50               # 50 for NIFTY, 100 for BANKNIFTY
+    # Index Settings
+    INDEX: str = INDEX
+    INDEX_EXCHANGE: str = "NSE_INDEX"       # Auto-set based on INDEX
+    OPTIONS_EXCHANGE: str = "NFO"           # Auto-set based on INDEX
+    STRIKE_INTERVAL: int = 50               # Auto-set based on INDEX
 
-    # Expiry Settings
-    # 1 = current week, 2 = next week, 3 = week after, etc.
-    EXPIRY_WEEK: int = 1
+    # Expiry & Capital (from top-level config)
+    EXPIRY_WEEK: int = EXPIRY_WEEK
+    CAPITAL_PERCENT: float = CAPITAL_PERCENT
 
-    # Capital & Position Sizing
-    CAPITAL_PERCENT: float = 0.80           # 80% of available capital
+    # Risk Management (from top-level config)
+    SL_PERCENT: float = SL_PERCENT
+    TARGET_MULTIPLIER: float = TARGET_MULTIPLIER
+    TRAIL_TRIGGER_PERCENT: float = TRAIL_TRIGGER_PERCENT
+    TRAIL_RATIO: float = TRAIL_RATIO
+    MAX_TRADES_PER_DAY: int = MAX_TRADES_PER_DAY
 
-    # Risk Management
-    SL_PERCENT: float = 0.05                # 5% below entry level
-    TARGET_MULTIPLIER: float = 2.80         # 180% profit (entry * 2.80)
-
-    # Trailing SL Settings
-    TRAIL_TRIGGER_PERCENT: float = 0.20     # Move SL to cost at 20% profit
-    TRAIL_RATIO: float = 1.0                # 1:1 trailing after trigger
-
-    # Trading Limits
-    MAX_TRADES_PER_DAY: int = 2
-
-    # Timing (IST)
+    # Timing (IST) - usually don't need to change
     MARKET_OPEN: str = "09:15"
     FIRST_CANDLE_CLOSE: str = "09:30"
     MARKET_CLOSE: str = "15:30"
-    EXIT_TIME: str = "14:59"                # Force exit time
+    EXIT_TIME: str = "14:59"
 
     # Strategy Name
     STRATEGY_NAME: str = "OptionsAlpha"
@@ -262,6 +286,39 @@ class TickManager:
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+def is_trading_day(client: api) -> tuple[bool, str]:
+    """
+    Check if today is a trading day.
+    Returns: (is_trading: bool, message: str)
+    """
+    today = datetime.now()
+
+    # Check if weekend
+    if today.weekday() >= 5:  # Saturday = 5, Sunday = 6
+        return False, "Weekend - Market closed"
+
+    # Check market timings API
+    try:
+        result = client.timings(date=today.strftime("%Y-%m-%d"))
+        if result.get("status") == "success":
+            data = result.get("data", [])
+            if not data:
+                return False, "Holiday - Market closed"
+
+            # Check if NSE/NFO is open
+            for exchange in data:
+                if exchange.get("exchange") in ["NSE", "NFO"]:
+                    return True, "Trading day"
+
+            return False, "NSE/NFO not open today"
+    except Exception as e:
+        # If API fails, assume it's a trading day (fail open)
+        print(f"Warning: Could not check market timings: {e}")
+        return True, "Assuming trading day (API check failed)"
+
+    return True, "Trading day"
+
 
 def get_nearest_strike(spot_price: float, strike_interval: int) -> int:
     """Calculate nearest strike price (ATM)"""
@@ -766,6 +823,14 @@ class OptionsAlphaStrategy:
         self.log(f"Starting {self.config.STRATEGY_NAME} Strategy for {self.config.INDEX} (WebSocket)")
 
         try:
+            # Check if today is a trading day
+            is_trading, message = is_trading_day(self.client)
+            if not is_trading:
+                self.log(f"{message}. Exiting strategy.")
+                return
+
+            self.log(f"Market status: {message}")
+
             # Wait for market open
             self.wait_for_market_open()
 
@@ -848,19 +913,18 @@ class OptionsAlphaStrategy:
 # =============================================================================
 
 if __name__ == "__main__":
-    # Create config with your settings
-    config = Config(
-        API_KEY="your_openalgo_api_key",  # Replace with your API key
-        HOST="http://127.0.0.1:5000",
-        WS_URL="ws://127.0.0.1:8765",
-        INDEX="NIFTY",
-        EXPIRY_WEEK=1,                     # Current week expiry
-        CAPITAL_PERCENT=0.80,              # Use 80% of capital
-        SL_PERCENT=0.05,                   # 5% SL
-        TARGET_MULTIPLIER=2.80,            # 180% profit target
-        TRAIL_TRIGGER_PERCENT=0.20,        # Trail at 20% profit
-        MAX_TRADES_PER_DAY=2
-    )
+    # Validate API key
+    if API_KEY == "your_api_key_here":
+        print("=" * 60)
+        print("ERROR: API key not configured!")
+        print("Edit the API_KEY variable at the top of this file")
+        print("Get your key from: http://127.0.0.1:5000/apikey")
+        print("=" * 60)
+        exit(1)
 
+    # Create config (uses top-level constants)
+    config = Config()
+
+    # Run strategy
     strategy = OptionsAlphaStrategy(config)
     strategy.run()
