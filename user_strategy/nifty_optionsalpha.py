@@ -61,11 +61,6 @@ MAX_TRADES_PER_DAY = 2
 class Config:
     """Strategy configuration - uses top-level constants as defaults"""
 
-    # OpenAlgo Settings (from top-level config)
-    API_KEY: str = API_KEY
-    HOST: str = HOST
-    WS_URL: str = WS_URL
-
     # Index Settings
     INDEX: str = INDEX
     INDEX_EXCHANGE: str = "NSE_INDEX"       # Auto-set based on INDEX
@@ -453,9 +448,9 @@ class OptionsAlphaStrategy:
     def __init__(self, config: Config):
         self.config = config
         self.client = api(
-            api_key=config.API_KEY,
-            host=config.HOST,
-            ws_url=config.WS_URL
+            api_key=API_KEY,
+            host=HOST,
+            ws_url=WS_URL
         )
 
         # Load index-specific config
@@ -914,7 +909,7 @@ class OptionsAlphaStrategy:
 
 if __name__ == "__main__":
     # Validate API key
-    if API_KEY == "your_api_key_here":
+    if API_KEY == "your_api_key_here" or len(API_KEY) < 10:
         print("=" * 60)
         print("ERROR: API key not configured!")
         print("Edit the API_KEY variable at the top of this file")
