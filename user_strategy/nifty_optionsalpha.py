@@ -28,11 +28,11 @@ from openalgo import api
 # =============================================================================
 
 # OpenAlgo API Key (get from http://127.0.0.1:5000/apikey)
-API_KEY = "5901954d90a7aeb2339a374cc2cfb8a3e868c8c61cbdddc5c7b89b3d8c84d562"
+API_KEY = "ccf48373cc52aaf4221150efcc976b40c4102dcb0e5ba3b01942ba713c20684f"
 
 # OpenAlgo Server
-HOST = "http://127.0.0.1:5000"
-WS_URL = "ws://127.0.0.1:8765"
+HOST = "http://127.0.0.1:5001"
+WS_URL = "ws://127.0.0.1:8766"
 
 # Index to trade
 INDEX = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
