@@ -1,5 +1,6 @@
 // components/trading/PlaceOrderDialog.tsx
 // Reusable order placement dialog with real-time quotes and market depth
+// Uses WebSocket for real-time data with REST API fallback (like Holdings/Positions)
 
 import { useCallback, useEffect, useState } from 'react'
 import {
@@ -20,7 +21,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useAuthStore } from '@/stores/authStore'
-import { useMarketData } from '@/hooks/useMarketData'
+import { useLiveQuote } from '@/hooks/useLiveQuote'
 import { tradingApi } from '@/api/trading'
 import { showToast } from '@/utils/toast'
 import { cn } from '@/lib/utils'
@@ -28,11 +29,12 @@ import { QuoteHeader } from './QuoteHeader'
 import { MarketDepthPanel } from './MarketDepthPanel'
 
 // Price types for order dialog
+// Backend API accepts: MARKET, LIMIT, SL (Stop Loss Limit), SL-M (Stop Loss Market)
 const PRICE_TYPES = [
   { value: 'MARKET', label: 'Market' },
   { value: 'LIMIT', label: 'Limit' },
-  { value: 'SL', label: 'SL' },
-  { value: 'SL-LIMIT', label: 'SL-Limit' },
+  { value: 'SL-M', label: 'SL-M' },      // Stop Loss Market (trigger only)
+  { value: 'SL', label: 'SL-L' },         // Stop Loss Limit (trigger + price)
 ] as const
 
 // Product types based on exchange
@@ -56,7 +58,7 @@ export interface PlaceOrderDialogProps {
   lotSize?: number
   tickSize?: number
   product?: 'MIS' | 'NRML' | 'CNC'
-  priceType?: 'MARKET' | 'LIMIT' | 'SL' | 'SL-LIMIT'
+  priceType?: 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
   strategy?: string
   onSuccess?: (orderId: string) => void
   onError?: (error: string) => void
@@ -65,7 +67,8 @@ export interface PlaceOrderDialogProps {
 // Tick size validation helpers
 function roundToTick(price: number, tickSize: number): number {
   if (tickSize <= 0) return price
-  return Math.round(price / tickSize) * tickSize
+  // Use toFixed to avoid floating point precision issues (e.g., 140.95000000000002)
+  return Number((Math.round(price / tickSize) * tickSize).toFixed(2))
 }
 
 function adjustPrice(price: number, tickSize: number, direction: 'up' | 'down'): number {
@@ -76,9 +79,11 @@ function adjustPrice(price: number, tickSize: number, direction: 'up' | 'down'):
   return Math.max(0, Number((rounded - tickSize).toFixed(2)))
 }
 
-// Check if exchange is F&O
+// Check if exchange is F&O/Commodity/Currency (uses NRML/MIS)
+// NSE, BSE = Equity → CNC/MIS
+// NFO, BFO, CDS, BCD, MCX, NCDEX = F&O/Currency/Commodity → NRML/MIS
 function isFnOExchange(exchange: string): boolean {
-  return ['NFO', 'BFO', 'MCX', 'CDS', 'BCD'].includes(exchange)
+  return ['NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NCDEX'].includes(exchange)
 }
 
 export function PlaceOrderDialog({
@@ -113,15 +118,29 @@ export function PlaceOrderDialog({
   // Get available product types based on exchange
   const productTypes = isFnOExchange(exchange) ? FNO_PRODUCT_TYPES : EQUITY_PRODUCT_TYPES
 
+  // Centralized live quote + depth with REST fallback (like useLivePrice for Holdings/Positions)
+  const { data: liveData, isLoading: isLoadingQuotes, isConnected } = useLiveQuote(symbol, exchange, {
+    enabled: open && !!symbol && !!exchange,
+    mode: 'Depth',
+    useQuotesFallback: true,
+    useDepthFallback: true,
+  })
+
   // Reset form when dialog opens with new values
   useEffect(() => {
     if (open) {
       setFormAction(initialAction)
       setFormQuantity(initialQuantity ?? lotSize)
       setFormPriceType(initialPriceType)
-      // Set default product based on exchange
-      const defaultProduct = isFnOExchange(exchange) ? 'NRML' : 'CNC'
-      setFormProduct(initialProduct || defaultProduct)
+      // Set default product based on exchange, validate initialProduct is valid for exchange
+      const isFnO = isFnOExchange(exchange)
+      const defaultProduct = isFnO ? 'NRML' : 'CNC'
+      // Validate product: CNC not valid for F&O, NRML not valid for equity
+      const validProducts = isFnO ? ['NRML', 'MIS'] : ['CNC', 'MIS']
+      const productToUse = initialProduct && validProducts.includes(initialProduct)
+        ? initialProduct
+        : defaultProduct
+      setFormProduct(productToUse)
       setFormPrice(0)
       setFormTriggerPrice(0)
       setIsDepthExpanded(false)
@@ -130,25 +149,35 @@ export function PlaceOrderDialog({
     }
   }, [open, initialAction, initialQuantity, lotSize, initialPriceType, initialProduct, exchange])
 
-  // Real-time market data
-  const { data: marketDataMap, isConnected } = useMarketData({
-    symbols: symbol && exchange ? [{ symbol, exchange }] : [],
-    mode: 'Depth',
-    enabled: open && !!symbol && !!exchange,
-  })
+  // Use data from centralized hook
+  const mergedData = {
+    ltp: liveData.ltp,
+    close: liveData.close,
+    change: liveData.change,
+    change_percent: liveData.changePercent,
+    bidPrice: liveData.bidPrice,
+    askPrice: liveData.askPrice,
+    bidSize: liveData.bidSize,
+    askSize: liveData.askSize,
+    depth: liveData.depth,
+  }
 
-  const marketData = marketDataMap.get(`${exchange}:${symbol}`)?.data
+  const displayChange = mergedData.change
+  const displayChangePercent = mergedData.change_percent
 
   // Set price to LTP when switching to LIMIT and LTP is available
   useEffect(() => {
-    if (formPriceType !== 'MARKET' && marketData?.ltp && formPrice === 0) {
-      setFormPrice(roundToTick(marketData.ltp, tickSize))
+    if (formPriceType !== 'MARKET' && mergedData.ltp && formPrice === 0) {
+      setFormPrice(roundToTick(mergedData.ltp, tickSize))
     }
-  }, [formPriceType, marketData?.ltp, formPrice, tickSize])
+  }, [formPriceType, mergedData.ltp, formPrice, tickSize])
 
-  // Validation
-  const needsPrice = formPriceType === 'LIMIT' || formPriceType === 'SL' || formPriceType === 'SL-LIMIT'
-  const needsTrigger = formPriceType === 'SL' || formPriceType === 'SL-LIMIT'
+  // Validation - determine which price fields are needed:
+  // LIMIT: price only
+  // SL-M (Stop Loss Market): trigger price only
+  // SL (Stop Loss Limit): both price and trigger price
+  const needsPrice = formPriceType === 'LIMIT' || formPriceType === 'SL'
+  const needsTrigger = formPriceType === 'SL-M' || formPriceType === 'SL'
 
   const isValid = useCallback(() => {
     if (!symbol || !exchange) return false
@@ -174,8 +203,9 @@ export function PlaceOrderDialog({
 
     setIsSubmitting(true)
     try {
-      // Convert SL-LIMIT to SL-M for API
-      const apiPriceType = formPriceType === 'SL-LIMIT' ? 'SL-M' : formPriceType as 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
+      // Price types are now directly mapped to API values
+      // Backend accepts: MARKET, LIMIT, SL (Stop Loss Limit), SL-M (Stop Loss Market)
+      const apiPriceType = formPriceType as 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
 
       const orderRequest = {
         apikey: apiKey,
@@ -192,28 +222,34 @@ export function PlaceOrderDialog({
 
       const response = await tradingApi.placeOrder(orderRequest)
 
-      if (response.status === 'success' && response.data?.orderid) {
-        showToast.success(`Order placed: ${response.data.orderid}`, 'orders')
-        onSuccess?.(response.data.orderid)
+      // Response structure: { status: "success", orderid: "..." } or { status: "error", message: "..." }
+      // Note: orderid is at root level, not in data field
+      const orderid = (response as unknown as { orderid?: string }).orderid
+      if (response.status === 'success' && orderid) {
+        // Toast is shown by useSocket when WebSocket receives order update
+        onSuccess?.(orderid)
         onOpenChange(false)
       } else {
         const errorMsg = response.message || 'Order placement failed'
         showToast.error(errorMsg, 'orders')
         onError?.(errorMsg)
       }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Order placement failed'
+    } catch (err: unknown) {
+      // Extract error message from axios error response or fallback to error message
+      let errorMsg = 'Order placement failed'
+      if (err && typeof err === 'object') {
+        const axiosError = err as { response?: { data?: { message?: string } }; message?: string }
+        if (axiosError.response?.data?.message) {
+          errorMsg = axiosError.response.data.message
+        } else if (axiosError.message) {
+          errorMsg = axiosError.message
+        }
+      }
       showToast.error(errorMsg, 'orders')
       onError?.(errorMsg)
     } finally {
       setIsSubmitting(false)
     }
-  }
-
-  // Lot multiplier handler
-  const handleLotMultiplier = (multiplier: number) => {
-    setLotMultiplier(multiplier)
-    setFormQuantity(lotSize * multiplier)
   }
 
   // Quantity change handler
@@ -234,9 +270,12 @@ export function PlaceOrderDialog({
   // Get display quantity based on mode
   const displayQuantity = quantityMode === 'lots' ? lotMultiplier : formQuantity
 
+  // Determine if we're still loading initial data
+  const isLoading = isLoadingQuotes && !mergedData.ltp && !isConnected
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[420px]">
+      <DialogContent className="sm:max-w-[420px]" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span>Place Order -</span>
@@ -250,24 +289,23 @@ export function PlaceOrderDialog({
         </DialogHeader>
 
         <div className="space-y-4 py-2">
-          {/* Quote Header */}
+          {/* Quote Header - merged WebSocket + REST data */}
           <QuoteHeader
-            symbol={symbol}
             exchange={exchange}
-            ltp={marketData?.ltp}
-            prevClose={marketData?.close}
-            change={marketData?.change}
-            changePercent={marketData?.change_percent}
-            bidPrice={marketData?.bid_price}
-            askPrice={marketData?.ask_price}
-            bidSize={marketData?.bid_size}
-            askSize={marketData?.ask_size}
-            isLoading={!isConnected && !marketData}
+            ltp={mergedData.ltp}
+            prevClose={mergedData.close}
+            change={displayChange}
+            changePercent={displayChangePercent}
+            bidPrice={mergedData.bidPrice}
+            askPrice={mergedData.askPrice}
+            bidSize={mergedData.bidSize}
+            askSize={mergedData.askSize}
+            isLoading={isLoading}
           />
 
-          {/* Market Depth Panel */}
+          {/* Market Depth Panel - only from WebSocket */}
           <MarketDepthPanel
-            depth={marketData?.depth}
+            depth={mergedData.depth}
             isExpanded={isDepthExpanded}
             onToggle={() => setIsDepthExpanded(!isDepthExpanded)}
             maxLevels={5}
@@ -302,7 +340,7 @@ export function PlaceOrderDialog({
             </div>
           </div>
 
-          {/* Quantity with Lot Multipliers and Mode Toggle */}
+          {/* Quantity with Mode Toggle */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <Label className="text-xs">Quantity</Label>
@@ -333,29 +371,12 @@ export function PlaceOrderDialog({
                 </button>
               </div>
             </div>
-            <div className="flex gap-2">
-              <div className="flex gap-1">
-                {[1, 2, 3].map((mult) => (
-                  <Button
-                    key={mult}
-                    type="button"
-                    variant={lotMultiplier === mult ? 'default' : 'outline'}
-                    size="sm"
-                    className="px-2 text-xs"
-                    onClick={() => handleLotMultiplier(mult)}
-                  >
-                    {mult}x
-                  </Button>
-                ))}
-              </div>
-              <Input
-                type="number"
-                value={displayQuantity}
-                onChange={(e) => handleQuantityChange(e.target.value)}
-                className="flex-1"
-                min={1}
-              />
-            </div>
+            <Input
+              type="number"
+              value={displayQuantity}
+              onChange={(e) => handleQuantityChange(e.target.value)}
+              min={1}
+            />
             <div className="flex justify-between text-[10px] text-muted-foreground">
               <span>Lot size: {lotSize}</span>
               <span>Total qty: {formQuantity}</span>
