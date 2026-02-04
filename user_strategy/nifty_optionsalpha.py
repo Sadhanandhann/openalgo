@@ -10,27 +10,96 @@ A momentum-based options buying strategy that:
 5. Manages position locally with target/SL
 
 Author: Generated with Claude
-Version: 2.1 (WebSocket + Holiday Check)
+Version: 3.0 (Robust Reconnection + Error Handling)
 """
 
 import time
 import threading
-from datetime import datetime, timedelta
+import logging
+import sys
+import os
+from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional, Literal, Dict, List
+from typing import Optional, Literal, Dict, List, Callable
 from collections import deque
-import pandas as pd
+from enum import Enum
+import traceback
 from openalgo import api
+
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+class StrategyLogger:
+    """Custom logger with console and optional file output"""
+
+    def __init__(self, name: str, log_to_file: bool = False, log_dir: str = "logs"):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.handlers = []  # Clear existing handlers
+
+        # Console handler (always enabled)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_format = logging.Formatter(
+            '[%(asctime)s] %(levelname)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler.setFormatter(console_format)
+        self.logger.addHandler(console_handler)
+
+        # File handler (optional)
+        if log_to_file:
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(
+                log_dir,
+                f"strategy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            )
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setLevel(logging.DEBUG)
+            file_format = logging.Formatter(
+                '[%(asctime)s] %(levelname)s [%(funcName)s:%(lineno)d]: %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_format)
+            self.logger.addHandler(file_handler)
+            self.logger.info(f"Logging to file: {log_file}")
+
+    def info(self, msg): self.logger.info(msg)
+    def debug(self, msg): self.logger.debug(msg)
+    def warning(self, msg): self.logger.warning(msg)
+    def error(self, msg): self.logger.error(msg)
+    def critical(self, msg): self.logger.critical(msg)
+
+
+# =============================================================================
+# CONNECTION STATE
+# =============================================================================
+
+class ConnectionState(Enum):
+    """WebSocket connection states"""
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    FAILED = "failed"
 
 
 # =============================================================================
 # USER CONFIGURATION - EDIT THESE VALUES
 # =============================================================================
 
-# OpenAlgo API Key (get from http://127.0.0.1:5000/apikey)
-API_KEY = "ccf48373cc52aaf4221150efcc976b40c4102dcb0e5ba3b01942ba713c20684f"
+# OpenAlgo API Key - loaded from central config
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.home() / ".config/openalgo"))
+try:
+    from client import API_KEY
+except ImportError:
+    API_KEY = "YOUR_API_KEY_HERE"  # Fallback - edit ~/.config/openalgo/config.json
 
-# OpenAlgo Server
+# OpenAlgo Server (Zerodha instance)
 HOST = "http://127.0.0.1:5001"
 WS_URL = "ws://127.0.0.1:8766"
 
@@ -47,12 +116,25 @@ CAPITAL_PERCENT = 0.80             # Use 80% of available capital
 SL_PERCENT = 0.05                  # 5% stop loss below entry level
 TARGET_MULTIPLIER = 2.80           # 180% profit target (entry * 2.80)
 
-# Trailing SL
-TRAIL_TRIGGER_PERCENT = 0.20       # Move SL to cost at 20% profit
-TRAIL_RATIO = 1.0                  # 1:1 trailing after trigger
+# Trailing SL (Level-based)
+SL_BUFFER_PERCENT = 0.10           # 10% below each R level for SL
+NUM_RESISTANCE_LEVELS = 6          # R1 to R6
 
 # Trading Limits
-MAX_TRADES_PER_DAY = 2
+MAX_COMPLETED_TRADES = 2               # Max completed (exited) trades per day
+NO_NEW_ENTRY_TIME = "14:15"            # No new entries after this time
+FORCE_EXIT_TIME = "15:00"              # Force exit all positions at this time
+
+# Robustness Settings
+LOG_TO_FILE = False                    # Enable file logging
+LOG_DIR = "logs"                       # Log directory
+MAX_RECONNECT_ATTEMPTS = 10            # Max WebSocket reconnection attempts
+RECONNECT_BASE_DELAY = 2               # Initial reconnect delay (seconds)
+RECONNECT_MAX_DELAY = 60               # Max reconnect delay (seconds)
+HEALTH_CHECK_INTERVAL = 30             # Check connection health every N seconds
+STALE_DATA_THRESHOLD = 60              # Data older than N seconds = stale
+AUTO_RESTART_ON_CRASH = True           # Auto-restart strategy on crash
+MAX_CRASH_RESTARTS = 3                 # Max restarts before giving up
 
 # =============================================================================
 
@@ -74,15 +156,16 @@ class Config:
     # Risk Management (from top-level config)
     SL_PERCENT: float = SL_PERCENT
     TARGET_MULTIPLIER: float = TARGET_MULTIPLIER
-    TRAIL_TRIGGER_PERCENT: float = TRAIL_TRIGGER_PERCENT
-    TRAIL_RATIO: float = TRAIL_RATIO
-    MAX_TRADES_PER_DAY: int = MAX_TRADES_PER_DAY
+    SL_BUFFER_PERCENT: float = SL_BUFFER_PERCENT
+    NUM_RESISTANCE_LEVELS: int = NUM_RESISTANCE_LEVELS
+    MAX_COMPLETED_TRADES: int = MAX_COMPLETED_TRADES
 
     # Timing (IST) - usually don't need to change
     MARKET_OPEN: str = "09:15"
     FIRST_CANDLE_CLOSE: str = "09:30"
     MARKET_CLOSE: str = "15:30"
-    EXIT_TIME: str = "14:59"
+    NO_NEW_ENTRY_TIME: str = NO_NEW_ENTRY_TIME
+    FORCE_EXIT_TIME: str = FORCE_EXIT_TIME
 
     # Strategy Name
     STRATEGY_NAME: str = "OptionsAlpha"
@@ -131,6 +214,28 @@ class EntryLevels:
 
 
 @dataclass
+class ResistanceLevels:
+    """Resistance levels calculated at 9:20 AM (static for the day)"""
+    bep: float                      # Break Even Point (reference)
+    r1: float                       # Resistance level 1
+    r2: float                       # Resistance level 2
+    r3: float                       # Resistance level 3
+    r4: float                       # Resistance level 4
+    r5: float                       # Resistance level 5
+    r6: float                       # Resistance level 6
+    true_atm: int                   # True ATM strike used for calculation
+    calculated_at: datetime         # When levels were calculated
+
+    def get_level(self, n: int) -> float:
+        """Get resistance level by number (1-6)"""
+        return getattr(self, f"r{n}", 0.0)
+
+    def get_all_levels(self) -> List[float]:
+        """Get all R levels as sorted list"""
+        return [self.r1, self.r2, self.r3, self.r4, self.r5, self.r6]
+
+
+@dataclass
 class Position:
     """Active position tracking"""
     option_type: Literal["CE", "PE"]
@@ -142,7 +247,7 @@ class Position:
     entry_time: datetime
     order_id: str
     cost_basis: float  # Total cost for PnL calculation
-    trail_triggered: bool = False
+    current_r_level: int = 0       # Current R level reached (0 = none, 1 = R1, etc.)
 
 
 @dataclass
@@ -167,31 +272,46 @@ class TickData:
 
 
 # =============================================================================
-# REAL-TIME TICK MANAGER (WebSocket)
+# REAL-TIME TICK MANAGER (WebSocket) - WITH ROBUST RECONNECTION
 # =============================================================================
 
 class TickManager:
-    """Manages real-time tick data via WebSocket"""
+    """Manages real-time tick data via WebSocket with auto-reconnection"""
 
-    def __init__(self, client: api, config: Config):
+    def __init__(self, client: api, config: Config, logger: StrategyLogger):
         self.client = client
         self.config = config
+        self.logger = logger
         self.ticks: Dict[str, TickData] = {}
         self.lock = threading.Lock()
-        self.connected = False
         self._current_minute: Dict[str, int] = {}
+
+        # Connection state management
+        self.state = ConnectionState.DISCONNECTED
+        self.subscribed_symbols: List[dict] = []
+        self.reconnect_attempts = 0
+        self.last_tick_time: Optional[datetime] = None
+
+        # Background threads
+        self._health_check_thread: Optional[threading.Thread] = None
+        self._stop_health_check = threading.Event()
+
+        # Callbacks
+        self.on_reconnect_callback: Optional[Callable] = None
+        self.on_disconnect_callback: Optional[Callable] = None
 
     def on_tick(self, data: dict):
         """Callback for WebSocket tick updates"""
         try:
             ltp_data = data.get("ltp", {})
-            for exchange, symbols in ltp_data.items():
+            for _exchange, symbols in ltp_data.items():
                 for symbol, info in symbols.items():
                     ltp = float(info.get("ltp", 0))
                     if ltp > 0:
                         self._update_tick(symbol, ltp)
+                        self.last_tick_time = datetime.now()
         except Exception as e:
-            print(f"[TickManager] Error processing tick: {e}")
+            self.logger.error(f"[TickManager] Error processing tick: {e}")
 
     def _update_tick(self, symbol: str, ltp: float):
         """Update tick data and build 1-min candles"""
@@ -236,6 +356,14 @@ class TickManager:
             tick = self.ticks.get(symbol)
             return tick.ltp if tick else 0.0
 
+    def get_tick_age(self, symbol: str) -> float:
+        """Get age of last tick in seconds"""
+        with self.lock:
+            tick = self.ticks.get(symbol)
+            if tick and tick.timestamp:
+                return (datetime.now() - tick.timestamp).total_seconds()
+            return float('inf')
+
     def get_last_candles(self, symbol: str, count: int = 2) -> List[Candle]:
         """Get last N completed 1-min candles"""
         with self.lock:
@@ -250,32 +378,126 @@ class TickManager:
             tick = self.ticks.get(symbol)
             return tick.current_candle if tick else None
 
-    def subscribe(self, symbols: List[dict]):
-        """Subscribe to symbols via WebSocket"""
+    def is_data_stale(self) -> bool:
+        """Check if data is stale (no recent ticks)"""
+        if not self.last_tick_time:
+            return True
+        age = (datetime.now() - self.last_tick_time).total_seconds()
+        return age > STALE_DATA_THRESHOLD
+
+    def subscribe(self, symbols: List[dict]) -> bool:
+        """Subscribe to symbols via WebSocket with retry logic"""
+        self.subscribed_symbols = symbols
+        return self._connect_and_subscribe()
+
+    def _connect_and_subscribe(self) -> bool:
+        """Internal method to connect and subscribe"""
+        self.state = ConnectionState.CONNECTING
         try:
             self.client.connect()
-            self.client.subscribe_ltp(symbols, on_data_received=self.on_tick)
-            self.connected = True
-            print(f"[TickManager] Subscribed to {len(symbols)} symbols")
+            self.client.subscribe_ltp(
+                self.subscribed_symbols,
+                on_data_received=self.on_tick
+            )
+            self.state = ConnectionState.CONNECTED
+            self.reconnect_attempts = 0
+            self.logger.info(f"[TickManager] Connected and subscribed to {len(self.subscribed_symbols)} symbols")
+
+            # Start health check thread
+            self._start_health_check()
+            return True
+
         except Exception as e:
-            print(f"[TickManager] Subscribe error: {e}")
-            self.connected = False
+            self.logger.error(f"[TickManager] Connection error: {e}")
+            self.state = ConnectionState.DISCONNECTED
+            return False
+
+    def reconnect(self) -> bool:
+        """Attempt to reconnect with exponential backoff"""
+        if self.state == ConnectionState.RECONNECTING:
+            return False
+
+        self.state = ConnectionState.RECONNECTING
+        self.reconnect_attempts += 1
+
+        if self.reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
+            self.logger.critical(f"[TickManager] Max reconnection attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded")
+            self.state = ConnectionState.FAILED
+            return False
+
+        # Calculate delay with exponential backoff
+        delay = min(
+            RECONNECT_BASE_DELAY * (2 ** (self.reconnect_attempts - 1)),
+            RECONNECT_MAX_DELAY
+        )
+
+        self.logger.warning(
+            f"[TickManager] Reconnecting in {delay}s (attempt {self.reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})"
+        )
+        time.sleep(delay)
+
+        # Try to disconnect cleanly first
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+
+        # Attempt reconnection
+        if self._connect_and_subscribe():
+            self.logger.info("[TickManager] Reconnection successful!")
+            if self.on_reconnect_callback:
+                self.on_reconnect_callback()
+            return True
+        else:
+            self.logger.error("[TickManager] Reconnection failed")
+            return self.reconnect()  # Retry
+
+    def _start_health_check(self):
+        """Start background health check thread"""
+        self._stop_health_check.clear()
+        self._health_check_thread = threading.Thread(
+            target=self._health_check_loop,
+            daemon=True
+        )
+        self._health_check_thread.start()
+
+    def _health_check_loop(self):
+        """Background loop to check connection health"""
+        while not self._stop_health_check.is_set():
+            time.sleep(HEALTH_CHECK_INTERVAL)
+
+            if self._stop_health_check.is_set():
+                break
+
+            # Check if data is stale
+            if self.state == ConnectionState.CONNECTED and self.is_data_stale():
+                self.logger.warning("[TickManager] Stale data detected, triggering reconnection")
+                if self.on_disconnect_callback:
+                    self.on_disconnect_callback()
+                self.reconnect()
 
     def unsubscribe(self, symbols: List[dict]):
         """Unsubscribe from symbols"""
         try:
             self.client.unsubscribe_ltp(symbols)
         except Exception as e:
-            print(f"[TickManager] Unsubscribe error: {e}")
+            self.logger.error(f"[TickManager] Unsubscribe error: {e}")
 
     def disconnect(self):
-        """Disconnect WebSocket"""
+        """Disconnect WebSocket and cleanup"""
+        self._stop_health_check.set()
+
         try:
             self.client.disconnect()
-            self.connected = False
-            print("[TickManager] Disconnected")
+            self.state = ConnectionState.DISCONNECTED
+            self.logger.info("[TickManager] Disconnected")
         except Exception as e:
-            print(f"[TickManager] Disconnect error: {e}")
+            self.logger.error(f"[TickManager] Disconnect error: {e}")
+
+    @property
+    def connected(self) -> bool:
+        """Check if currently connected"""
+        return self.state == ConnectionState.CONNECTED
 
 
 # =============================================================================
@@ -286,30 +508,37 @@ def is_trading_day(client: api) -> tuple[bool, str]:
     """
     Check if today is a trading day.
     Returns: (is_trading: bool, message: str)
+
+    Note: Checks market timings API first to handle special trading days
+    (e.g., Union Budget day on weekends). Weekend check is only used as fallback.
     """
     today = datetime.now()
+    is_weekend = today.weekday() >= 5  # Saturday = 5, Sunday = 6
 
-    # Check if weekend
-    if today.weekday() >= 5:  # Saturday = 5, Sunday = 6
-        return False, "Weekend - Market closed"
-
-    # Check market timings API
+    # Check market timings API first (handles special trading days like Budget day)
     try:
         result = client.timings(date=today.strftime("%Y-%m-%d"))
         if result.get("status") == "success":
             data = result.get("data", [])
             if not data:
+                # No exchange data = holiday or market closed
+                if is_weekend:
+                    return False, "Weekend - Market closed"
                 return False, "Holiday - Market closed"
 
             # Check if NSE/NFO is open
             for exchange in data:
                 if exchange.get("exchange") in ["NSE", "NFO"]:
+                    if is_weekend:
+                        return True, "Special trading day (market open on weekend)"
                     return True, "Trading day"
 
             return False, "NSE/NFO not open today"
     except Exception as e:
-        # If API fails, assume it's a trading day (fail open)
+        # If API fails, use weekend check as fallback
         print(f"Warning: Could not check market timings: {e}")
+        if is_weekend:
+            return False, "Weekend - Market closed (API check failed)"
         return True, "Assuming trading day (API check failed)"
 
     return True, "Trading day"
@@ -318,6 +547,18 @@ def is_trading_day(client: api) -> tuple[bool, str]:
 def get_nearest_strike(spot_price: float, strike_interval: int) -> int:
     """Calculate nearest strike price (ATM)"""
     return round(spot_price / strike_interval) * strike_interval
+
+
+def round_to_tick(price: float, tick_size: float = 0.05) -> float:
+    """
+    Round price to nearest tick size (default 0.05 for options).
+
+    Examples:
+        round_to_tick(245.23) → 245.25
+        round_to_tick(245.21) → 245.20
+        round_to_tick(245.00) → 245.00
+    """
+    return round(round(price / tick_size) * tick_size, 2)
 
 
 def get_expiry_date(client: api, index: str, exchange: str, expiry_week: int) -> str:
@@ -358,6 +599,142 @@ def get_lot_size(client: api, symbol: str, exchange: str) -> int:
     if result.get("status") == "success":
         return result.get("data", {}).get("lotsize", 75)
     return INDEX_CONFIG.get(symbol[:5], {}).get("lot_size", 75)
+
+
+def get_5min_candle_close(client: api, symbol: str, exchange: str) -> float:
+    """
+    Fetch the first 5-minute candle close (9:15-9:20).
+    Returns: close price
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    df = client.history(
+        symbol=symbol,
+        exchange=exchange,
+        interval="5m",
+        start_date=today,
+        end_date=today
+    )
+
+    if isinstance(df, dict) and df.get("status") == "error":
+        raise Exception(f"Failed to fetch 5min candle: {df.get('message')}")
+
+    if df is None or df.empty:
+        raise Exception(f"No 5min candle data for {symbol}")
+
+    # Get the first candle (9:15-9:20)
+    first_candle = df.iloc[0]
+    return float(first_candle["close"])
+
+
+def calculate_resistance_levels(
+    client: api,
+    index: str,
+    index_exchange: str,
+    options_exchange: str,
+    strike_interval: int,
+    expiry_date: str,
+    num_levels: int = 6
+) -> ResistanceLevels:
+    """
+    Calculate resistance levels (R1-R6) at 9:20 AM using first 5-min candle close.
+
+    Formula:
+    - TRUE_ATM = strike where |CE_close - PE_close| is minimum
+    - BEP = (ATM_CE + ATM_PE) / 2
+    - R1 = ((ATM-1*gap)_CE + (ATM+1*gap)_PE) / 2
+    - R2 = ((ATM-2*gap)_CE + (ATM+2*gap)_PE) / 2
+    - ...and so on for R3-R6
+
+    Returns: ResistanceLevels dataclass with bep, r1-r6, true_atm
+    """
+    # Step 1: Get spot price from first 5-min candle
+    spot_close = get_5min_candle_close(client, index, index_exchange)
+    print(f"[Levels] {index} spot (5min close): {spot_close}")
+
+    # Step 2: Get approximate ATM
+    approx_atm = int(round(spot_close / strike_interval)) * strike_interval
+    print(f"[Levels] Approximate ATM: {approx_atm}")
+
+    # Step 3: Build option symbols for strikes around ATM
+    # We need strikes from (ATM - 2*gap) to (ATM + num_levels*gap) for finding true ATM and calculating levels
+    strikes_needed = []
+    for offset in range(-2, num_levels + 3):  # Extra buffer for true ATM search
+        strikes_needed.append(approx_atm + (offset * strike_interval))
+
+    # Step 4: Fetch 5-min close prices for all required options
+    option_prices = {}  # {strike_CE: price, strike_PE: price}
+
+    for strike in strikes_needed:
+        ce_symbol = build_option_symbol(index, expiry_date, strike, "CE")
+        pe_symbol = build_option_symbol(index, expiry_date, strike, "PE")
+
+        try:
+            ce_close = get_5min_candle_close(client, ce_symbol, options_exchange)
+            option_prices[f"{strike}_CE"] = ce_close
+        except Exception as e:
+            print(f"[Levels] Warning: Could not get CE price for {strike}: {e}")
+            option_prices[f"{strike}_CE"] = 0.0
+
+        try:
+            pe_close = get_5min_candle_close(client, pe_symbol, options_exchange)
+            option_prices[f"{strike}_PE"] = pe_close
+        except Exception as e:
+            print(f"[Levels] Warning: Could not get PE price for {strike}: {e}")
+            option_prices[f"{strike}_PE"] = 0.0
+
+    # Step 5: Find TRUE ATM (strike where |CE - PE| is minimum)
+    min_diff = float('inf')
+    true_atm = approx_atm
+
+    for offset in range(-2, 3):  # Check ±2 strikes from approx ATM
+        strike = approx_atm + (offset * strike_interval)
+        ce_price = option_prices.get(f"{strike}_CE", 0)
+        pe_price = option_prices.get(f"{strike}_PE", 0)
+
+        if ce_price > 0 and pe_price > 0:
+            diff = abs(ce_price - pe_price)
+            if diff < min_diff:
+                min_diff = diff
+                true_atm = strike
+
+    print(f"[Levels] TRUE ATM: {true_atm} (diff: {min_diff:.2f})")
+
+    # Step 6: Calculate BEP
+    atm_ce = option_prices.get(f"{true_atm}_CE", 0)
+    atm_pe = option_prices.get(f"{true_atm}_PE", 0)
+    bep = (atm_ce + atm_pe) / 2.0
+    print(f"[Levels] BEP: {bep:.2f} (ATM_CE: {atm_ce:.2f}, ATM_PE: {atm_pe:.2f})")
+
+    # Step 7: Calculate R1-R6
+    # R_n = ((ATM - n*gap)_CE + (ATM + n*gap)_PE) / 2
+    r_levels = []
+    for i in range(1, num_levels + 1):
+        ce_strike = true_atm - (i * strike_interval)  # Lower strike CE (more expensive)
+        pe_strike = true_atm + (i * strike_interval)  # Higher strike PE (more expensive)
+
+        ce_price = option_prices.get(f"{ce_strike}_CE", 0)
+        pe_price = option_prices.get(f"{pe_strike}_PE", 0)
+
+        r_value = (ce_price + pe_price) / 2.0
+        r_levels.append(round_to_tick(r_value))
+        print(f"[Levels] R{i}: {round_to_tick(r_value):.2f} (CE@{ce_strike}: {ce_price:.2f}, PE@{pe_strike}: {pe_price:.2f})")
+
+    # Pad with zeros if needed
+    while len(r_levels) < 6:
+        r_levels.append(0.0)
+
+    return ResistanceLevels(
+        bep=round_to_tick(bep),
+        r1=r_levels[0],
+        r2=r_levels[1],
+        r3=r_levels[2],
+        r4=r_levels[3],
+        r5=r_levels[4],
+        r6=r_levels[5],
+        true_atm=true_atm,
+        calculated_at=datetime.now()
+    )
 
 
 def get_15min_candle(client: api, symbol: str, exchange: str) -> dict:
@@ -443,10 +820,18 @@ def check_entry_condition_ws(
 # =============================================================================
 
 class OptionsAlphaStrategy:
-    """Main strategy class with WebSocket support"""
+    """Main strategy class with WebSocket support and robust error handling"""
 
     def __init__(self, config: Config):
         self.config = config
+
+        # Setup logger first
+        self.logger = StrategyLogger(
+            name=config.STRATEGY_NAME,
+            log_to_file=LOG_TO_FILE,
+            log_dir=LOG_DIR
+        )
+
         self.client = api(
             api_key=API_KEY,
             host=HOST,
@@ -459,24 +844,59 @@ class OptionsAlphaStrategy:
         self.options_exchange = idx_config["options_exchange"]
         self.strike_interval = idx_config["strike_interval"]
 
-        # Tick manager for WebSocket
-        self.tick_manager = TickManager(self.client, config)
+        # Tick manager for WebSocket (with logger)
+        self.tick_manager = TickManager(self.client, config, self.logger)
+
+        # Set reconnection callbacks
+        self.tick_manager.on_reconnect_callback = self._on_ws_reconnect
+        self.tick_manager.on_disconnect_callback = self._on_ws_disconnect
 
         # State
+        self.resistance_levels: Optional[ResistanceLevels] = None
         self.entry_levels: Optional[EntryLevels] = None
         self.position: Optional[Position] = None
-        self.trades_today: int = 0
+        self.completed_trades: int = 0      # Tracks COMPLETED (exited) trades
+        self.can_trade: bool = True          # Flag to control new entries
         self.daily_pnl: float = 0.0
         self.trade_log: list = []
         self.subscribed_symbols: List[dict] = []
 
+        # Crash recovery state
+        self.crash_count: int = 0
+        self.running: bool = False
+
     def log(self, message: str):
         """Log message with timestamp"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] {message}")
+        self.logger.info(message)
+
+    def _on_ws_reconnect(self):
+        """Callback when WebSocket reconnects"""
+        self.log("WebSocket reconnected - resuming strategy")
+
+    def _on_ws_disconnect(self):
+        """Callback when WebSocket disconnects"""
+        self.log("WebSocket disconnected - will attempt reconnection")
+
+    def is_market_hours(self) -> tuple[bool, str]:
+        """
+        Check if we're within tradeable market hours.
+        Returns: (can_trade: bool, message: str)
+        """
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+
+        market_open = datetime.strptime(f"{today_str} {self.config.MARKET_OPEN}", "%Y-%m-%d %H:%M")
+        market_close = datetime.strptime(f"{today_str} {self.config.MARKET_CLOSE}", "%Y-%m-%d %H:%M")
+
+        if now > market_close:
+            return False, f"Market is closed for today (closes at {self.config.MARKET_CLOSE})"
+        elif now < market_open:
+            return True, f"Market not yet open (opens at {self.config.MARKET_OPEN})"
+        else:
+            return True, "Market is open"
 
     def wait_for_market_open(self):
-        """Wait until market opens"""
+        """Wait until market opens (called only if market not yet closed)"""
         self.log(f"Waiting for market open at {self.config.MARKET_OPEN}...")
 
         while True:
@@ -492,6 +912,59 @@ class OptionsAlphaStrategy:
             time.sleep(10)
 
         self.log("Market is open!")
+
+    def wait_for_5min_candle_and_calculate_levels(self):
+        """Wait for first 5-min candle (9:20) and calculate R1-R6 levels"""
+        self.log("Waiting for first 5-min candle to close at 09:20...")
+
+        while True:
+            now = datetime.now()
+            candle_close = datetime.strptime(
+                f"{now.strftime('%Y-%m-%d')} 09:20",
+                "%Y-%m-%d %H:%M"
+            )
+
+            if now >= candle_close:
+                break
+
+            time.sleep(5)
+
+        # Wait a bit for data to be available
+        time.sleep(5)
+        self.log("First 5-min candle closed! Calculating resistance levels...")
+
+        # Get expiry date first (needed for level calculation)
+        expiry_date = get_expiry_date(
+            self.client,
+            self.config.INDEX,
+            self.options_exchange,
+            self.config.EXPIRY_WEEK
+        )
+        self.log(f"Using expiry: {expiry_date}")
+
+        # Calculate resistance levels
+        self.resistance_levels = calculate_resistance_levels(
+            client=self.client,
+            index=self.config.INDEX,
+            index_exchange=self.index_exchange,
+            options_exchange=self.options_exchange,
+            strike_interval=self.strike_interval,
+            expiry_date=expiry_date,
+            num_levels=self.config.NUM_RESISTANCE_LEVELS
+        )
+
+        self.log("=" * 50)
+        self.log("RESISTANCE LEVELS (Static for today)")
+        self.log("=" * 50)
+        self.log(f"TRUE ATM: {self.resistance_levels.true_atm}")
+        self.log(f"BEP: {self.resistance_levels.bep:.2f}")
+        self.log(f"R1: {self.resistance_levels.r1:.2f}")
+        self.log(f"R2: {self.resistance_levels.r2:.2f}")
+        self.log(f"R3: {self.resistance_levels.r3:.2f}")
+        self.log(f"R4: {self.resistance_levels.r4:.2f}")
+        self.log(f"R5: {self.resistance_levels.r5:.2f}")
+        self.log(f"R6: {self.resistance_levels.r6:.2f}")
+        self.log("=" * 50)
 
     def wait_for_first_candle(self):
         """Wait for first 15-min candle to complete (9:30)"""
@@ -609,12 +1082,159 @@ class OptionsAlphaStrategy:
             return available * self.config.CAPITAL_PERCENT
         return 0.0
 
+    def get_ltp_http(self, symbol: str, exchange: str) -> float:
+        """
+        Get LTP via HTTP API (fallback when WebSocket unavailable).
+
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange (NFO, NSE, etc.)
+
+        Returns:
+            LTP price or 0.0 if failed
+        """
+        try:
+            result = self.client.quotes(symbol=symbol, exchange=exchange)
+            if result.get("status") == "success":
+                ltp = float(result.get("data", {}).get("ltp", 0))
+                return ltp
+        except Exception as e:
+            self.logger.error(f"HTTP LTP fetch failed for {symbol}: {e}")
+        return 0.0
+
+    def get_ltp_with_fallback(self, symbol: str, exchange: str = None) -> float:
+        """
+        Get LTP with WebSocket primary and HTTP fallback.
+
+        Priority:
+        1. WebSocket (if connected and data fresh)
+        2. HTTP API (fallback)
+
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange (defaults to options_exchange)
+
+        Returns:
+            LTP price or 0.0 if all methods fail
+        """
+        exchange = exchange or self.options_exchange
+
+        # Try WebSocket first (if connected and data is fresh)
+        if self.tick_manager.connected:
+            ws_ltp = self.tick_manager.get_ltp(symbol)
+            tick_age = self.tick_manager.get_tick_age(symbol)
+
+            # Use WebSocket data if fresh (< 5 seconds old)
+            if ws_ltp > 0 and tick_age < 5:
+                return ws_ltp
+
+            # WebSocket data is stale, log warning
+            if ws_ltp > 0:
+                self.logger.warning(f"WebSocket data stale ({tick_age:.1f}s), using HTTP fallback")
+
+        # Fallback to HTTP
+        http_ltp = self.get_ltp_http(symbol, exchange)
+        if http_ltp > 0:
+            self.logger.debug(f"HTTP LTP for {symbol}: {http_ltp}")
+            return http_ltp
+
+        # Last resort: return stale WebSocket data if available
+        if self.tick_manager.connected:
+            ws_ltp = self.tick_manager.get_ltp(symbol)
+            if ws_ltp > 0:
+                self.logger.warning(f"Using stale WebSocket data for {symbol}: {ws_ltp}")
+                return ws_ltp
+
+        self.logger.error(f"Failed to get LTP for {symbol} (both WS and HTTP failed)")
+        return 0.0
+
+    def verify_order_executed(
+        self,
+        order_id: str,
+        expected_action: str,
+        max_wait_seconds: int = 10,
+        check_interval: float = 0.5
+    ) -> dict:
+        """
+        Verify order execution status.
+
+        Args:
+            order_id: Order ID to check
+            expected_action: Expected action (BUY/SELL)
+            max_wait_seconds: Maximum time to wait for execution
+            check_interval: Time between status checks
+
+        Returns:
+            dict with keys:
+                - executed: bool
+                - status: str (order status)
+                - filled_qty: int
+                - avg_price: float
+                - message: str
+        """
+        start_time = time.time()
+        last_status = "UNKNOWN"
+
+        self.log(f"Verifying order {order_id}...")
+
+        while (time.time() - start_time) < max_wait_seconds:
+            try:
+                result = self.client.orderstatus(order_id=order_id)
+
+                if result.get("status") == "success":
+                    order_data = result.get("data", {})
+                    order_status = order_data.get("order_status", "").upper()
+                    last_status = order_status
+
+                    # Check for completed/executed status
+                    if order_status in ["COMPLETE", "COMPLETED", "FILLED", "EXECUTED"]:
+                        filled_qty = int(order_data.get("filled_quantity", order_data.get("quantity", 0)))
+                        avg_price = float(order_data.get("average_price", order_data.get("price", 0)))
+
+                        self.log(f"Order EXECUTED: Qty={filled_qty}, Avg Price={avg_price:.2f}")
+                        return {
+                            "executed": True,
+                            "status": order_status,
+                            "filled_qty": filled_qty,
+                            "avg_price": round_to_tick(avg_price),
+                            "message": "Order executed successfully"
+                        }
+
+                    # Check for rejected/cancelled
+                    elif order_status in ["REJECTED", "CANCELLED", "CANCELED", "FAILED"]:
+                        reject_reason = order_data.get("reject_reason", order_data.get("message", "Unknown"))
+                        self.logger.error(f"Order {order_status}: {reject_reason}")
+                        return {
+                            "executed": False,
+                            "status": order_status,
+                            "filled_qty": 0,
+                            "avg_price": 0.0,
+                            "message": f"Order {order_status}: {reject_reason}"
+                        }
+
+                    # Still pending - continue waiting
+                    self.logger.debug(f"Order status: {order_status}, waiting...")
+
+                else:
+                    self.logger.warning(f"orderstatus API error: {result.get('message')}")
+
+            except Exception as e:
+                self.logger.error(f"Error checking order status: {e}")
+
+            time.sleep(check_interval)
+
+        # Timeout
+        self.logger.warning(f"Order verification timeout. Last status: {last_status}")
+        return {
+            "executed": False,
+            "status": last_status,
+            "filled_qty": 0,
+            "avg_price": 0.0,
+            "message": f"Timeout waiting for order execution. Last status: {last_status}"
+        }
+
     def place_order(self, option_type: Literal["CE", "PE"], entry_price: float) -> Optional[Position]:
         """Place buy order and create position"""
-        if self.trades_today >= self.config.MAX_TRADES_PER_DAY:
-            self.log(f"Max trades ({self.config.MAX_TRADES_PER_DAY}) reached for today")
-            return None
-
         symbol = self.entry_levels.ce_symbol if option_type == "CE" else self.entry_levels.pe_symbol
         entry_level = self.entry_levels.ce_entry_level if option_type == "CE" else self.entry_levels.pe_entry_level
 
@@ -640,141 +1260,268 @@ class OptionsAlphaStrategy:
         )
 
         if result.get("status") != "success":
-            self.log(f"Order failed: {result.get('message')}")
+            self.log(f"Order placement failed: {result.get('message')}")
             return None
 
         order_id = result.get("orderid", "")
-        self.log(f"Order placed successfully! Order ID: {order_id}")
+        self.log(f"Order placed! Order ID: {order_id}")
 
-        # Get actual fill price from WebSocket
-        time.sleep(1)
-        actual_price = self.tick_manager.get_ltp(symbol)
+        # Verify order execution
+        verification = self.verify_order_executed(order_id, "BUY")
+
+        if not verification["executed"]:
+            self.logger.error(f"BUY order not executed: {verification['message']}")
+            return None
+
+        # Use verified fill price (fallback to WebSocket LTP if not available)
+        actual_price = verification["avg_price"]
+        if actual_price <= 0:
+            actual_price = self.tick_manager.get_ltp(symbol)
         if actual_price <= 0:
             actual_price = entry_price
 
-        # Calculate SL and Target
-        sl_price = entry_level * (1 - self.config.SL_PERCENT)
-        target_price = actual_price * self.config.TARGET_MULTIPLIER
+        actual_price = round_to_tick(actual_price)
+        filled_qty = verification["filled_qty"] if verification["filled_qty"] > 0 else quantity
 
-        self.trades_today += 1
+        # Calculate SL and Target (rounded to tick size)
+        sl_price = round_to_tick(entry_level * (1 - self.config.SL_PERCENT))
+        target_price = round_to_tick(actual_price * self.config.TARGET_MULTIPLIER)
 
         position = Position(
             option_type=option_type,
             symbol=symbol,
             entry_price=actual_price,
-            quantity=quantity,
+            quantity=filled_qty,
             sl_price=sl_price,
             target_price=target_price,
             entry_time=datetime.now(),
             order_id=order_id,
-            cost_basis=actual_price * quantity,
-            trail_triggered=False
+            cost_basis=actual_price * filled_qty,
+            current_r_level=0
         )
 
-        self.log(f"Position created: Entry={actual_price:.2f}, SL={sl_price:.2f}, Target={target_price:.2f}")
+        self.log(f"Position CONFIRMED: Entry={actual_price:.2f}, Qty={filled_qty}, SL={sl_price:.2f}, Target={target_price:.2f}")
+
+        # Log R levels for reference
+        if self.resistance_levels:
+            self.log(f"Trail levels: R1={self.resistance_levels.r1:.2f}, R2={self.resistance_levels.r2:.2f}, "
+                     f"R3={self.resistance_levels.r3:.2f}, R4={self.resistance_levels.r4:.2f}")
         return position
 
     def manage_position(self) -> bool:
         """
-        Manage active position with trailing SL using WebSocket data.
+        Manage active position with level-based trailing SL using WebSocket data.
+
+        Trailing Logic:
+        - LTP touches R1 → SL moves to R1 × (1 - SL_BUFFER_PERCENT)
+        - LTP touches R2 → SL moves to R2 × (1 - SL_BUFFER_PERCENT)
+        - ... and so on for R3-R6
+
         Returns True if position is closed, False otherwise.
         """
         if not self.position:
             return False
 
-        # Get LTP from WebSocket (instant!)
-        ltp = self.tick_manager.get_ltp(self.position.symbol)
+        if not self.resistance_levels:
+            return False
+
+        # Get LTP with WebSocket + HTTP fallback (critical for SL/target)
+        ltp = self.get_ltp_with_fallback(self.position.symbol)
         if ltp <= 0:
+            self.logger.warning("Could not get LTP for position management")
             return False
 
         current_value = ltp * self.position.quantity
         pnl = current_value - self.position.cost_basis
-        pnl_percent = pnl / self.position.cost_basis
+        pnl_percent = (pnl / self.position.cost_basis) * 100
 
         # Check target hit
         if ltp >= self.position.target_price:
             self.log(f"TARGET HIT! LTP: {ltp:.2f}, Target: {self.position.target_price:.2f}")
-            return self.exit_position("TARGET")
+            return self.close_position("TARGET")
 
         # Check SL hit
         if ltp <= self.position.sl_price:
             self.log(f"SL HIT! LTP: {ltp:.2f}, SL: {self.position.sl_price:.2f}")
-            return self.exit_position("STOPLOSS")
+            return self.close_position("STOPLOSS")
 
-        # Trailing SL logic
-        if not self.position.trail_triggered:
-            # Check if trail trigger reached (20% profit)
-            if pnl_percent >= self.config.TRAIL_TRIGGER_PERCENT:
-                self.position.sl_price = self.position.entry_price  # Move SL to cost
-                self.position.trail_triggered = True
-                self.log(f"Trail triggered! SL moved to cost: {self.position.sl_price:.2f}")
-        else:
-            # 1:1 trailing after trigger
-            # If PnL is X%, SL should be at (X - TRAIL_TRIGGER_PERCENT)% profit
-            if pnl_percent > self.config.TRAIL_TRIGGER_PERCENT:
-                trail_profit = pnl_percent - self.config.TRAIL_TRIGGER_PERCENT
-                new_sl = self.position.entry_price * (1 + trail_profit * self.config.TRAIL_RATIO)
+        # Level-based Trailing SL logic
+        # Check each R level from current+1 to R6
+        r_levels = self.resistance_levels.get_all_levels()  # [R1, R2, R3, R4, R5, R6]
+
+        for level_num in range(self.position.current_r_level + 1, len(r_levels) + 1):
+            r_value = r_levels[level_num - 1]  # R1 is at index 0
+
+            # Check if LTP has touched this R level
+            if ltp >= r_value and r_value > 0:
+                # Calculate new SL (10% below this R level)
+                new_sl = round_to_tick(r_value * (1 - self.config.SL_BUFFER_PERCENT))
+
+                # Only update if new SL is higher than current SL
                 if new_sl > self.position.sl_price:
+                    old_sl = self.position.sl_price
                     self.position.sl_price = new_sl
-                    self.log(f"SL trailed to: {self.position.sl_price:.2f} (PnL: {pnl_percent*100:.1f}%)")
+                    self.position.current_r_level = level_num
+                    self.log(
+                        f"R{level_num} TOUCHED! LTP: {ltp:.2f}, R{level_num}: {r_value:.2f} | "
+                        f"SL moved: {old_sl:.2f} → {new_sl:.2f} (PnL: {pnl_percent:.1f}%)"
+                    )
 
         return False
 
-    def exit_position(self, reason: str) -> bool:
-        """Exit current position"""
+    def close_position(self, reason: str, max_retries: int = 3) -> bool:
+        """
+        Robust position close method with retries.
+
+        Args:
+            reason: Exit reason (STOPLOSS, TARGET, TIME_EXIT, MANUAL_EXIT, etc.)
+            max_retries: Number of retry attempts for failed orders
+
+        Returns:
+            True if position closed successfully, False otherwise
+        """
         if not self.position:
+            self.log("No position to close")
             return False
 
-        self.log(f"Exiting position: {reason}")
+        self.log(f"{'='*50}")
+        self.log(f"CLOSING POSITION: {reason}")
+        self.log(f"Symbol: {self.position.symbol}, Qty: {self.position.quantity}")
+        self.log(f"{'='*50}")
 
-        result = self.client.placeorder(
-            strategy=self.config.STRATEGY_NAME,
-            symbol=self.position.symbol,
-            exchange=self.options_exchange,
-            action="SELL",
-            quantity=self.position.quantity,
-            price_type="MARKET",
-            product="MIS"
-        )
+        # Store position details before closing
+        symbol = self.position.symbol
+        quantity = self.position.quantity
+        entry_price = self.position.entry_price
+        option_type = self.position.option_type
+        entry_time = self.position.entry_time
+        r_level_reached = self.position.current_r_level
 
-        if result.get("status") != "success":
-            self.log(f"Exit order failed: {result.get('message')}")
+        # Attempt to close with retries
+        order_success = False
+        exit_price = 0.0
+
+        for attempt in range(1, max_retries + 1):
+            self.log(f"Exit attempt {attempt}/{max_retries}...")
+
+            try:
+                result = self.client.placeorder(
+                    strategy=self.config.STRATEGY_NAME,
+                    symbol=symbol,
+                    exchange=self.options_exchange,
+                    action="SELL",
+                    quantity=quantity,
+                    price_type="MARKET",
+                    product="MIS"
+                )
+
+                if result.get("status") == "success":
+                    order_id = result.get("orderid", "")
+                    self.log(f"Exit order placed! Order ID: {order_id}")
+
+                    # Verify order execution
+                    verification = self.verify_order_executed(order_id, "SELL")
+
+                    if verification["executed"]:
+                        order_success = True
+                        exit_price = verification["avg_price"]
+
+                        # Fallback if avg_price not available
+                        if exit_price <= 0:
+                            exit_price = self.tick_manager.get_ltp(symbol)
+                        if exit_price <= 0:
+                            if reason == "STOPLOSS":
+                                exit_price = self.position.sl_price
+                            elif reason == "TARGET":
+                                exit_price = self.position.target_price
+                            else:
+                                exit_price = entry_price
+
+                        exit_price = round_to_tick(exit_price)
+                        self.log(f"Exit CONFIRMED at {exit_price:.2f}")
+                        break
+                    else:
+                        self.logger.warning(f"Exit order not confirmed: {verification['message']}")
+                        if attempt < max_retries:
+                            time.sleep(2)
+
+                else:
+                    self.log(f"Exit order placement failed: {result.get('message')}")
+                    if attempt < max_retries:
+                        time.sleep(2)  # Wait before retry
+
+            except Exception as e:
+                self.logger.error(f"Exit order exception: {e}")
+                if attempt < max_retries:
+                    time.sleep(2)
+
+        if not order_success:
+            self.logger.critical(f"FAILED TO CLOSE POSITION after {max_retries} attempts!")
+            self.logger.critical(f"MANUAL INTERVENTION REQUIRED: {symbol} x {quantity}")
             return False
 
-        # Get exit price from WebSocket
-        time.sleep(1)
-        exit_price = self.tick_manager.get_ltp(self.position.symbol)
-        if exit_price <= 0:
-            exit_price = self.position.sl_price if reason == "STOPLOSS" else self.position.target_price
-
-        pnl = (exit_price - self.position.entry_price) * self.position.quantity
+        # Calculate PnL
+        pnl = (exit_price - entry_price) * quantity
         self.daily_pnl += pnl
 
+        # Record trade
         trade_record = {
-            "symbol": self.position.symbol,
-            "option_type": self.position.option_type,
-            "entry_price": self.position.entry_price,
+            "symbol": symbol,
+            "option_type": option_type,
+            "entry_price": entry_price,
             "exit_price": exit_price,
-            "quantity": self.position.quantity,
+            "quantity": quantity,
             "pnl": pnl,
             "exit_reason": reason,
-            "entry_time": self.position.entry_time.strftime("%H:%M:%S"),
-            "exit_time": datetime.now().strftime("%H:%M:%S")
+            "entry_time": entry_time.strftime("%H:%M:%S"),
+            "exit_time": datetime.now().strftime("%H:%M:%S"),
+            "r_level_reached": r_level_reached
         }
         self.trade_log.append(trade_record)
 
-        self.log(f"Position closed: Entry={self.position.entry_price:.2f}, Exit={exit_price:.2f}, PnL={pnl:.2f}")
+        # Clear position
         self.position = None
+
+        # Increment completed trades
+        self.completed_trades += 1
+
+        # Log summary
+        pnl_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+        self.log(f"Position CLOSED: Entry={entry_price:.2f}, Exit={exit_price:.2f}, PnL={pnl_str}")
+        self.log(f"Completed trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
+
+        # Check if max trades reached - stop new entries
+        if self.completed_trades >= self.config.MAX_COMPLETED_TRADES:
+            self.can_trade = False
+            self.log(f"MAX COMPLETED TRADES ({self.config.MAX_COMPLETED_TRADES}) REACHED - No more entries today")
+
         return True
 
-    def is_exit_time(self) -> bool:
-        """Check if it's time to force exit"""
+    def is_force_exit_time(self) -> bool:
+        """Check if it's time to force exit all positions (15:00)"""
         now = datetime.now()
         exit_time = datetime.strptime(
-            f"{now.strftime('%Y-%m-%d')} {self.config.EXIT_TIME}",
+            f"{now.strftime('%Y-%m-%d')} {self.config.FORCE_EXIT_TIME}",
             "%Y-%m-%d %H:%M"
         )
         return now >= exit_time
+
+    def is_new_entry_allowed(self) -> bool:
+        """
+        Check if new entries are allowed.
+        Returns False if:
+        - Time is past NO_NEW_ENTRY_TIME (14:15)
+        - can_trade flag is False (max completed trades reached)
+        """
+        if not self.can_trade:
+            return False
+
+        now = datetime.now()
+        cutoff_time = datetime.strptime(
+            f"{now.strftime('%Y-%m-%d')} {self.config.NO_NEW_ENTRY_TIME}",
+            "%Y-%m-%d %H:%M"
+        )
+        return now < cutoff_time
 
     def print_summary(self):
         """Print end of day summary"""
@@ -783,7 +1530,7 @@ class OptionsAlphaStrategy:
         self.log("=" * 60)
         self.log(f"Index: {self.config.INDEX}")
         self.log(f"ATM Strike: {self.entry_levels.atm_strike if self.entry_levels else 'N/A'}")
-        self.log(f"Total Trades: {self.trades_today}")
+        self.log(f"Completed Trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
         self.log(f"Daily PnL: {self.daily_pnl:.2f}")
         self.log("-" * 60)
 
@@ -807,18 +1554,48 @@ class OptionsAlphaStrategy:
         status += f"CE: {ce_ltp:.2f} (Entry: {self.entry_levels.ce_entry_level:.2f})"
 
         if self.position:
-            pos_ltp = self.tick_manager.get_ltp(self.position.symbol)
-            pnl = (pos_ltp - self.position.entry_price) * self.position.quantity
-            status += f" | POS: {self.position.option_type} PnL: {pnl:.2f} SL: {self.position.sl_price:.2f}"
+            pos_ltp = self.get_ltp_with_fallback(self.position.symbol)
+            pnl = (pos_ltp - self.position.entry_price) * self.position.quantity if pos_ltp > 0 else 0
+            r_level = f"R{self.position.current_r_level}" if self.position.current_r_level > 0 else "Entry"
+            status += f" | POS: {self.position.option_type} LTP: {pos_ltp:.2f} PnL: {pnl:.2f} SL: {self.position.sl_price:.2f} [{r_level}]"
+
+            # Show next R level to watch
+            if self.resistance_levels and self.position.current_r_level < 6:
+                next_r = self.resistance_levels.get_level(self.position.current_r_level + 1)
+                status += f" Next: R{self.position.current_r_level + 1}={next_r:.2f}"
 
         self.log(status)
 
+    def safe_execute(self, func: Callable, description: str, *args, **kwargs):
+        """Execute a function with error handling and retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                self.logger.error(f"{description} failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    raise
+
     def run(self):
-        """Main strategy loop"""
-        self.log(f"Starting {self.config.STRATEGY_NAME} Strategy for {self.config.INDEX} (WebSocket)")
+        """Main strategy loop with robust error handling"""
+        self.running = True
+        self.log(f"Starting {self.config.STRATEGY_NAME} Strategy for {self.config.INDEX} (WebSocket v3.0)")
+        self.log(f"Robustness: reconnect_attempts={MAX_RECONNECT_ATTEMPTS}, health_check={HEALTH_CHECK_INTERVAL}s")
 
         try:
-            # Check if today is a trading day
+            # FIRST: Check market hours (local check, no API needed)
+            # This allows immediate exit if running after market close
+            can_trade, hours_message = self.is_market_hours()
+            if not can_trade:
+                self.log(f"{hours_message}. Exiting strategy.")
+                return
+
+            self.log(f"Market hours: {hours_message}")
+
+            # SECOND: Check if today is a trading day (holiday check via API)
             is_trading, message = is_trading_day(self.client)
             if not is_trading:
                 self.log(f"{message}. Exiting strategy.")
@@ -826,86 +1603,198 @@ class OptionsAlphaStrategy:
 
             self.log(f"Market status: {message}")
 
-            # Wait for market open
+            # Wait for market open (if before 9:15)
             self.wait_for_market_open()
 
-            # Wait for first 15-min candle
+            # Wait for first 5-min candle (9:20) and calculate R1-R6 levels
+            self.safe_execute(
+                self.wait_for_5min_candle_and_calculate_levels,
+                "Calculate resistance levels"
+            )
+
+            # Wait for first 15-min candle (9:30)
             self.wait_for_first_candle()
 
-            # Calculate entry levels
-            self.entry_levels = self.calculate_entry_levels()
+            # Calculate entry levels (with retry)
+            self.entry_levels = self.safe_execute(
+                self.calculate_entry_levels,
+                "Calculate entry levels"
+            )
 
-            # Setup WebSocket
-            self.setup_websocket()
+            # Setup WebSocket (with retry)
+            self.safe_execute(self.setup_websocket, "Setup WebSocket")
 
             # Main trading loop
             self.log("Starting main trading loop (WebSocket mode)...")
             last_status_time = datetime.now()
+            last_health_log = datetime.now()
             status_interval = 30  # Print status every 30 seconds
 
-            while True:
-                # Check exit time
-                if self.is_exit_time():
-                    self.log("Exit time reached!")
+            while self.running:
+                try:
+                    # Check force exit time (15:00)
+                    if self.is_force_exit_time():
+                        self.log("FORCE EXIT TIME (15:00) reached!")
+                        if self.position:
+                            self.close_position("TIME_EXIT")
+                        break
+
+                    # Check WebSocket health
+                    if self.tick_manager.state == ConnectionState.FAILED:
+                        self.logger.critical("WebSocket permanently failed - exiting strategy")
+                        if self.position:
+                            self.close_position("WS_FAILED")
+                        break
+
+                    # Check if max completed trades reached (no position, can't trade)
+                    if not self.position and not self.can_trade:
+                        self.log("Max completed trades reached. Waiting for exit time...")
+                        time.sleep(60)  # Check every minute
+                        continue
+
+                    # Log health status periodically
+                    if (datetime.now() - last_health_log).seconds >= 300:  # Every 5 mins
+                        self._log_health_status()
+                        last_health_log = datetime.now()
+
+                    # Print status periodically
+                    if (datetime.now() - last_status_time).seconds >= status_interval:
+                        self.print_status()
+                        last_status_time = datetime.now()
+
+                    # Skip trading logic if WebSocket is not connected
+                    if not self.tick_manager.connected:
+                        time.sleep(1)
+                        continue
+
+                    # If we have a position, manage it
                     if self.position:
-                        self.exit_position("TIME_EXIT")
-                    break
+                        self.manage_position()
 
-                # Print status periodically
-                if (datetime.now() - last_status_time).seconds >= status_interval:
-                    self.print_status()
-                    last_status_time = datetime.now()
+                    # If no position and new entries allowed, check entry conditions
+                    elif self.is_new_entry_allowed():
+                        # Check PE entry condition
+                        if check_entry_condition_ws(
+                            self.tick_manager,
+                            self.entry_levels.pe_symbol,
+                            self.entry_levels.pe_entry_level
+                        ):
+                            ltp = self.tick_manager.get_ltp(self.entry_levels.pe_symbol)
+                            self.log(f"PE Entry condition met! LTP: {ltp:.2f}")
+                            self.position = self.place_order("PE", ltp)
 
-                # If we have a position, manage it
-                if self.position:
-                    self.manage_position()
+                        # Check CE entry condition
+                        elif check_entry_condition_ws(
+                            self.tick_manager,
+                            self.entry_levels.ce_symbol,
+                            self.entry_levels.ce_entry_level
+                        ):
+                            ltp = self.tick_manager.get_ltp(self.entry_levels.ce_symbol)
+                            self.log(f"CE Entry condition met! LTP: {ltp:.2f}")
+                            self.position = self.place_order("CE", ltp)
 
-                # If no position and haven't hit max trades, check entry conditions
-                elif self.trades_today < self.config.MAX_TRADES_PER_DAY:
-                    # Check PE entry condition
-                    if check_entry_condition_ws(
-                        self.tick_manager,
-                        self.entry_levels.pe_symbol,
-                        self.entry_levels.pe_entry_level
-                    ):
-                        ltp = self.tick_manager.get_ltp(self.entry_levels.pe_symbol)
-                        self.log(f"PE Entry condition met! LTP: {ltp:.2f}")
-                        self.position = self.place_order("PE", ltp)
+                    # Small sleep to prevent CPU spinning (WebSocket handles the data)
+                    time.sleep(0.1)
 
-                    # Check CE entry condition
-                    elif check_entry_condition_ws(
-                        self.tick_manager,
-                        self.entry_levels.ce_symbol,
-                        self.entry_levels.ce_entry_level
-                    ):
-                        ltp = self.tick_manager.get_ltp(self.entry_levels.ce_symbol)
-                        self.log(f"CE Entry condition met! LTP: {ltp:.2f}")
-                        self.position = self.place_order("CE", ltp)
-
-                # Small sleep to prevent CPU spinning (WebSocket handles the data)
-                time.sleep(0.1)
+                except Exception as loop_error:
+                    self.logger.error(f"Error in main loop: {loop_error}")
+                    self.logger.debug(traceback.format_exc())
+                    time.sleep(1)  # Prevent tight error loop
 
         except KeyboardInterrupt:
-            self.log("Strategy interrupted by user")
+            self.log("Strategy interrupted by user (Ctrl+C)")
+            self.running = False
             if self.position:
-                self.exit_position("MANUAL_EXIT")
+                self.close_position("MANUAL_EXIT")
 
         except Exception as e:
-            self.log(f"Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            self.logger.critical(f"Critical error: {str(e)}")
+            self.logger.error(traceback.format_exc())
             if self.position:
-                self.exit_position("ERROR_EXIT")
+                try:
+                    self.close_position("ERROR_EXIT")
+                except Exception:
+                    self.logger.error("Failed to exit position on error")
+            raise  # Re-raise for crash recovery
 
         finally:
+            self.running = False
             self.cleanup_websocket()
             self.print_summary()
             self.log("Strategy finished.")
 
+    def _log_health_status(self):
+        """Log current health status"""
+        ws_state = self.tick_manager.state.value
+        stale = self.tick_manager.is_data_stale()
+        reconnects = self.tick_manager.reconnect_attempts
+
+        self.logger.info(
+            f"[Health] WS: {ws_state}, Stale: {stale}, Reconnects: {reconnects}, "
+            f"Completed: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}, PnL: {self.daily_pnl:.2f}"
+        )
+
+    def stop(self):
+        """Gracefully stop the strategy"""
+        self.log("Stop requested...")
+        self.running = False
+
 
 # =============================================================================
-# ENTRY POINT
+# ENTRY POINT WITH CRASH RECOVERY
 # =============================================================================
+
+def run_with_crash_recovery():
+    """Run strategy with automatic crash recovery"""
+    crash_count = 0
+
+    while True:
+        try:
+            # Create fresh config and strategy instance
+            config = Config()
+            strategy = OptionsAlphaStrategy(config)
+
+            if crash_count > 0:
+                strategy.log(f"Restarting after crash (attempt {crash_count}/{MAX_CRASH_RESTARTS})")
+
+            # Run strategy
+            strategy.run()
+
+            # If we get here normally (no exception), exit the loop
+            break
+
+        except KeyboardInterrupt:
+            print("\n[MAIN] Keyboard interrupt - exiting")
+            break
+
+        except Exception as e:
+            crash_count += 1
+            print(f"\n[MAIN] Strategy crashed: {e}")
+            print(traceback.format_exc())
+
+            if not AUTO_RESTART_ON_CRASH:
+                print("[MAIN] Auto-restart disabled - exiting")
+                break
+
+            if crash_count >= MAX_CRASH_RESTARTS:
+                print(f"[MAIN] Max crash restarts ({MAX_CRASH_RESTARTS}) exceeded - exiting")
+                break
+
+            # Check if market is still open before restarting
+            now = datetime.now()
+            exit_time = datetime.strptime(
+                f"{now.strftime('%Y-%m-%d')} 15:00",
+                "%Y-%m-%d %H:%M"
+            )
+            if now >= exit_time:
+                print("[MAIN] Market closed - not restarting")
+                break
+
+            # Wait before restart
+            restart_delay = 10 * crash_count  # Increasing delay
+            print(f"[MAIN] Restarting in {restart_delay} seconds...")
+            time.sleep(restart_delay)
+
 
 if __name__ == "__main__":
     # Validate API key
@@ -917,9 +1806,10 @@ if __name__ == "__main__":
         print("=" * 60)
         exit(1)
 
-    # Create config (uses top-level constants)
-    config = Config()
+    print("=" * 60)
+    print("Options Alpha Strategy v3.0")
+    print("Features: WebSocket, Auto-Reconnect, Crash Recovery")
+    print("=" * 60)
 
-    # Run strategy
-    strategy = OptionsAlphaStrategy(config)
-    strategy.run()
+    # Run with crash recovery wrapper
+    run_with_crash_recovery()
