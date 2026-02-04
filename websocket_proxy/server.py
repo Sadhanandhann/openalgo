@@ -1550,7 +1550,10 @@ class WebSocketProxy:
                 client_ids = self.subscription_index.get(sub_key, set()).copy()
 
                 if not client_ids:
+                    logger.debug(f"No clients subscribed to {sub_key}, subscription_index has {len(self.subscription_index)} keys")
                     continue  # No WebSocket clients subscribed, skip delivery
+
+                logger.debug(f"Forwarding to {len(client_ids)} clients subscribed to {sub_key}")
 
                 # OPTIMIZATION 3: Batch message sends for parallel delivery
                 send_tasks = []

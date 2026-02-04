@@ -581,7 +581,10 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 mode_str = mode_map.get(data_type, "UNKNOWN")
                 topic = f"{exchange}_{symbol}_{mode_str}"
 
+                self.logger.debug(f"Publishing to topic: {topic}, ltp={market_data.get('ltp')}")
                 self.publish_market_data(topic, market_data)
+            else:
+                self.logger.warning(f"market_data is None for {symbol}, data_type={data_type}")
 
         except Exception as e:
             self.logger.error(f"Error processing 5-depth data: {e}", exc_info=True)
