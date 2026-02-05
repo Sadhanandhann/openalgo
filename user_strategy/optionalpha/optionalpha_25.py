@@ -1,16 +1,131 @@
 #!/usr/bin/env python
 """
-Options Alpha Strategy - First 15-Min Breakout (WebSocket Version)
-===================================================================
-A momentum-based options buying strategy that:
-1. Waits for first 15-min candle to form
-2. Calculates ATM strike and entry levels
-3. Uses WebSocket for real-time price updates
-4. Enters on breakout with trailing SL
-5. Manages position locally with target/SL
+Options Alpha 25 - Simplified Version (WebSocket)
+==================================================
+
+STRATEGY OVERVIEW:
+------------------
+A simplified momentum-based options buying strategy that trades ATM options
+using a fixed 25-point target with breakeven trailing stop loss. The strategy
+captures directional moves in the first hour of trading with simple profit
+protection logic.
+
+CORE CONCEPTS:
+--------------
+1. **Simple Timeframe Approach**:
+   - 15-min candle (9:15-9:30): Determine ATM strike and entry levels
+
+2. **Entry Logic**:
+   - Waits for price to break above entry level with confirmation
+   - Entry level for PE: Average(PE 15min low, CE 15min high)
+   - Entry level for CE: Average(CE 15min low, CE 15min high)
+   - Confirmation: Current 1min candle open AND close above entry level
+   - Crossover: Previous 1min candle open OR close below entry level
+
+3. **Fixed Target & Breakeven Stop Loss**:
+   - Initial SL: 5% below entry level
+   - Target: Entry price + 25 points (fixed)
+   - Trailing Logic: When profit reaches 20 points, move SL to cost (breakeven)
+   - SL only moves UP to breakeven, never down
+   - Simple and predictable profit protection
+
+TIMING & SCHEDULE:
+------------------
+09:15 - Market opens
+09:30 - First 15-min candle closes → Calculate ATM strike & entry levels
+09:31 - Strategy starts monitoring for entry conditions
+14:15 - No new entries allowed after this time
+15:00 - Force exit all positions
+15:30 - Market closes
+
+RISK MANAGEMENT:
+----------------
+- Capital: 80% of available funds per trade
+- Max Trades: 2 completed trades per day (default)
+- Stop Loss: 5% below entry level initially, moves to cost when profit reaches 20 points
+- Target: Entry price + 25 points (fixed)
+- Position Sizing: Calculated based on capital and lot size
+- Only one position at a time (CE or PE, whichever breaks out first)
+
+TECHNICAL FEATURES:
+-------------------
+- WebSocket-first architecture with HTTP fallback for price updates
+- Auto-reconnection with exponential backoff (up to 10 attempts)
+- Health monitoring every 30 seconds
+- Stale data detection and automatic recovery
+- Crash recovery with up to 3 restart attempts
+- Order verification with retry logic (3 attempts)
+- Thread-safe tick data management
+- 1-minute candle building from WebSocket ticks
+
+EXAMPLE TRADE FLOW:
+-------------------
+09:30 AM:
+  - NIFTY 15min close: 22,510
+  - ATM Strike: 22,500 (auto-calculated via optionsymbol API)
+  - PE Symbol: NIFTY10FEB2622500PE
+  - CE Symbol: NIFTY10FEB2622500CE
+  - PE 15min: Low=140, High=160
+  - CE 15min: Low=145, High=165
+  - PE Entry Level: (140 + 165) / 2 = 152.50
+  - CE Entry Level: (145 + 165) / 2 = 155.00
+
+09:42 AM:
+  - PE LTP crosses 152.50
+  - Current 1min candle: Open=153, Close=154 (both > 152.50) ✓
+  - Previous 1min candle: Open=151, Close=152 (at least one < 152.50) ✓
+  - Entry confirmed! Buy PE @ 154.00
+  - Initial SL: 152.50 × 0.95 = 144.88
+  - Target: 154.00 + 25 = 179.00
+
+10:05 AM:
+  - PE LTP reaches 174.00
+  - Profit: 174.00 - 154.00 = 20 points ✓
+  - SL moves to COST: 154.00 (breakeven protection activated)
+  - Target still: 179.00
+
+10:20 AM:
+  - PE LTP reaches 179.50
+  - Target hit at 179.00
+  - Exit @ 179.00
+  - PnL: (179.00 - 154.00) × qty = 25 points × qty
+  - Trade closed with full 25-point profit!
+
+CONFIGURATION OPTIONS:
+----------------------
+Edit these constants at the top of the file:
+
+INDEX = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
+EXPIRY_WEEK = 1                    # 1=current, 2=next week
+CAPITAL_PERCENT = 0.80             # Use 80% of available capital
+SL_PERCENT = 0.05                  # 5% initial stop loss
+TARGET_POINTS = 25                 # Fixed 25-point profit target
+BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches 20 points
+MAX_COMPLETED_TRADES = 2           # Max trades per day
+NO_NEW_ENTRY_TIME = "14:15"        # Last entry time
+FORCE_EXIT_TIME = "14:59"          # Square off time
+
+REQUIREMENTS:
+-------------
+- OpenAlgo API running on http://127.0.0.1:5003
+- WebSocket server running on ws://127.0.0.1:8765
+- API key configured in ~/.config/openalgo/config.json
+- Live broker connection with sufficient margin
+- Market data subscription for selected index
+
+USAGE:
+------
+uv run python3 nifty_optionsalpha.py
+
+LOGS:
+-----
+- Console: INFO level messages
+- File: logs/strategy_YYYYMMDD_HHMMSS.log (if LOG_TO_FILE=True)
 
 Author: Generated with Claude
-Version: 3.0 (Robust Reconnection + Error Handling)
+Version: 25.0 (Simplified)
+Last Updated: 2026-02-05
+Base: Options Alpha Strategy v3.0
 """
 
 import time
@@ -24,6 +139,8 @@ from typing import Optional, Literal, Dict, List, Callable
 from collections import deque
 from enum import Enum
 import traceback
+from pathlib import Path
+import pandas as pd
 from openalgo import api
 
 
@@ -91,16 +208,15 @@ class ConnectionState(Enum):
 # =============================================================================
 
 # OpenAlgo API Key - loaded from central config
-import sys
 from pathlib import Path
 sys.path.insert(0, str(Path.home() / ".config/openalgo"))
 try:
     from client import API_KEY
 except ImportError:
-    API_KEY = "YOUR_API_KEY_HERE"  # Fallback - edit ~/.config/openalgo/config.json
+    API_KEY = "0a7ea96180c4bffa62c7401005779eccbc3d3a0a26676bcd241f182979d6bd01"  # Fallback - edit ~/.config/openalgo/config.json
 
 # OpenAlgo Server
-HOST = "http://127.0.0.1:5000"
+HOST = "http://127.0.0.1:5003"
 WS_URL = "ws://127.0.0.1:8765"
 
 # Index to trade
@@ -110,20 +226,17 @@ INDEX = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
 EXPIRY_WEEK = 1
 
 # Capital & Position Sizing
-CAPITAL_PERCENT = 0.80             # Use 80% of available capital
+CAPITAL_PERCENT = 0.90             # Use 90% of available capital
 
 # Risk Management
 SL_PERCENT = 0.05                  # 5% stop loss below entry level
-TARGET_MULTIPLIER = 2.80           # 180% profit target (entry * 2.80)
-
-# Trailing SL (Level-based)
-SL_BUFFER_PERCENT = 0.10           # 10% below each R level for SL
-NUM_RESISTANCE_LEVELS = 6          # R1 to R6
+TARGET_POINTS = 25                 # Fixed 25-point profit target
+BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches this
 
 # Trading Limits
-MAX_COMPLETED_TRADES = 2               # Max completed (exited) trades per day
+MAX_COMPLETED_TRADES = 2           # Max completed (exited) trades per day
 NO_NEW_ENTRY_TIME = "14:15"            # No new entries after this time
-FORCE_EXIT_TIME = "15:00"              # Force exit all positions at this time
+FORCE_EXIT_TIME = "14:59"              # Force exit all positions at this time
 
 # Robustness Settings
 LOG_TO_FILE = False                    # Enable file logging
@@ -135,6 +248,9 @@ HEALTH_CHECK_INTERVAL = 30             # Check connection health every N seconds
 STALE_DATA_THRESHOLD = 60              # Data older than N seconds = stale
 AUTO_RESTART_ON_CRASH = True           # Auto-restart strategy on crash
 MAX_CRASH_RESTARTS = 3                 # Max restarts before giving up
+
+# Excel Performance Tracking
+EXCEL_LOG_FILE = "optionalpha_performance.xlsx"  # Excel file for trade history
 
 # =============================================================================
 
@@ -155,9 +271,8 @@ class Config:
 
     # Risk Management (from top-level config)
     SL_PERCENT: float = SL_PERCENT
-    TARGET_MULTIPLIER: float = TARGET_MULTIPLIER
-    SL_BUFFER_PERCENT: float = SL_BUFFER_PERCENT
-    NUM_RESISTANCE_LEVELS: int = NUM_RESISTANCE_LEVELS
+    TARGET_POINTS: float = TARGET_POINTS
+    BREAKEVEN_POINTS: float = BREAKEVEN_POINTS
     MAX_COMPLETED_TRADES: int = MAX_COMPLETED_TRADES
 
     # Timing (IST) - usually don't need to change
@@ -214,40 +329,20 @@ class EntryLevels:
 
 
 @dataclass
-class ResistanceLevels:
-    """Resistance levels calculated at 9:20 AM (static for the day)"""
-    bep: float                      # Break Even Point (reference)
-    r1: float                       # Resistance level 1
-    r2: float                       # Resistance level 2
-    r3: float                       # Resistance level 3
-    r4: float                       # Resistance level 4
-    r5: float                       # Resistance level 5
-    r6: float                       # Resistance level 6
-    true_atm: int                   # True ATM strike used for calculation
-    calculated_at: datetime         # When levels were calculated
-
-    def get_level(self, n: int) -> float:
-        """Get resistance level by number (1-6)"""
-        return getattr(self, f"r{n}", 0.0)
-
-    def get_all_levels(self) -> List[float]:
-        """Get all R levels as sorted list"""
-        return [self.r1, self.r2, self.r3, self.r4, self.r5, self.r6]
-
-
-@dataclass
 class Position:
-    """Active position tracking"""
+    """Active position tracking - tracks only positions created by THIS strategy instance"""
     option_type: Literal["CE", "PE"]
     symbol: str
     entry_price: float
     quantity: int
-    sl_price: float
+    sl_price: float                    # Current SL (can change with breakeven)
     target_price: float
     entry_time: datetime
-    order_id: str
-    cost_basis: float  # Total cost for PnL calculation
-    current_r_level: int = 0       # Current R level reached (0 = none, 1 = R1, etc.)
+    order_id: str                      # Entry order ID (unique identifier)
+    cost_basis: float                  # Total cost for PnL calculation
+    breakeven_activated: bool = False  # Track if breakeven SL has been applied
+    strategy_tag: str = ""             # Strategy name that created this position
+    initial_sl: float = 0.0            # Original SL at entry (doesn't change)
 
 
 @dataclass
@@ -413,47 +508,53 @@ class TickManager:
             return False
 
     def reconnect(self) -> bool:
-        """Attempt to reconnect with exponential backoff"""
+        """Attempt to reconnect with exponential backoff (iterative, not recursive)"""
         if self.state == ConnectionState.RECONNECTING:
             return False
 
         self.state = ConnectionState.RECONNECTING
-        self.reconnect_attempts += 1
 
-        if self.reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
-            self.logger.critical(f"[TickManager] Max reconnection attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded")
-            self.state = ConnectionState.FAILED
-            return False
+        # Iterative reconnection to avoid stack overflow
+        while self.reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+            self.reconnect_attempts += 1
 
-        # Calculate delay with exponential backoff
-        delay = min(
-            RECONNECT_BASE_DELAY * (2 ** (self.reconnect_attempts - 1)),
-            RECONNECT_MAX_DELAY
-        )
+            # Calculate delay with exponential backoff
+            delay = min(
+                RECONNECT_BASE_DELAY * (2 ** (self.reconnect_attempts - 1)),
+                RECONNECT_MAX_DELAY
+            )
 
-        self.logger.warning(
-            f"[TickManager] Reconnecting in {delay}s (attempt {self.reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})"
-        )
-        time.sleep(delay)
+            self.logger.warning(
+                f"[TickManager] Reconnecting in {delay}s (attempt {self.reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})"
+            )
+            time.sleep(delay)
 
-        # Try to disconnect cleanly first
-        try:
-            self.client.disconnect()
-        except Exception:
-            pass
+            # Try to disconnect cleanly first
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
 
-        # Attempt reconnection
-        if self._connect_and_subscribe():
-            self.logger.info("[TickManager] Reconnection successful!")
-            if self.on_reconnect_callback:
-                self.on_reconnect_callback()
-            return True
-        else:
-            self.logger.error("[TickManager] Reconnection failed")
-            return self.reconnect()  # Retry
+            # Attempt reconnection
+            if self._connect_and_subscribe():
+                self.logger.info("[TickManager] Reconnection successful!")
+                if self.on_reconnect_callback:
+                    self.on_reconnect_callback()
+                return True
+            else:
+                self.logger.error(f"[TickManager] Reconnection attempt {self.reconnect_attempts} failed")
+
+        # All attempts exhausted
+        self.logger.critical(f"[TickManager] Max reconnection attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded")
+        self.state = ConnectionState.FAILED
+        return False
 
     def _start_health_check(self):
-        """Start background health check thread"""
+        """Start background health check thread (only if not already running)"""
+        # Prevent multiple health check threads
+        if self._health_check_thread and self._health_check_thread.is_alive():
+            return
+
         self._stop_health_check.clear()
         self._health_check_thread = threading.Thread(
             target=self._health_check_loop,
@@ -535,18 +636,14 @@ def is_trading_day(client: api) -> tuple[bool, str]:
 
             return False, "NSE/NFO not open today"
     except Exception as e:
-        # If API fails, use weekend check as fallback
+        # If API fails, fail-safe: don't trade on uncertain days
         print(f"Warning: Could not check market timings: {e}")
         if is_weekend:
             return False, "Weekend - Market closed (API check failed)"
-        return True, "Assuming trading day (API check failed)"
+        # FAIL-SAFE: Don't trade if we can't confirm it's a trading day
+        return False, "Cannot confirm trading day (API check failed) - not trading to be safe"
 
     return True, "Trading day"
-
-
-def get_nearest_strike(spot_price: float, strike_interval: int) -> int:
-    """Calculate nearest strike price (ATM)"""
-    return round(spot_price / strike_interval) * strike_interval
 
 
 def round_to_tick(price: float, tick_size: float = 0.05) -> float:
@@ -589,16 +686,12 @@ def build_option_symbol(index: str, expiry_date: str, strike: int, option_type: 
     """
     Build option symbol in OpenAlgo format.
     Example: NIFTY28NOV2526000CE
+
+    Note: This is only used for resistance level calculation where we need to
+    build multiple symbols (20+ API calls would be slow). For main entry level
+    calculation, use optionsymbol() API instead.
     """
     return f"{index}{expiry_date}{strike}{option_type}"
-
-
-def get_lot_size(client: api, symbol: str, exchange: str) -> int:
-    """Fetch lot size for an option symbol"""
-    result = client.symbol(symbol=symbol, exchange=exchange)
-    if result.get("status") == "success":
-        return result.get("data", {}).get("lotsize", 75)
-    return INDEX_CONFIG.get(symbol[:5], {}).get("lot_size", 75)
 
 
 def get_5min_candle_close(client: api, symbol: str, exchange: str) -> float:
@@ -627,114 +720,9 @@ def get_5min_candle_close(client: api, symbol: str, exchange: str) -> float:
     return float(first_candle["close"])
 
 
-def calculate_resistance_levels(
-    client: api,
-    index: str,
-    index_exchange: str,
-    options_exchange: str,
-    strike_interval: int,
-    expiry_date: str,
-    num_levels: int = 6
-) -> ResistanceLevels:
-    """
-    Calculate resistance levels (R1-R6) at 9:20 AM using first 5-min candle close.
-
-    Formula:
-    - TRUE_ATM = strike where |CE_close - PE_close| is minimum
-    - BEP = (ATM_CE + ATM_PE) / 2
-    - R1 = ((ATM-1*gap)_CE + (ATM+1*gap)_PE) / 2
-    - R2 = ((ATM-2*gap)_CE + (ATM+2*gap)_PE) / 2
-    - ...and so on for R3-R6
-
-    Returns: ResistanceLevels dataclass with bep, r1-r6, true_atm
-    """
-    # Step 1: Get spot price from first 5-min candle
-    spot_close = get_5min_candle_close(client, index, index_exchange)
-    print(f"[Levels] {index} spot (5min close): {spot_close}")
-
-    # Step 2: Get approximate ATM
-    approx_atm = int(round(spot_close / strike_interval)) * strike_interval
-    print(f"[Levels] Approximate ATM: {approx_atm}")
-
-    # Step 3: Build option symbols for strikes around ATM
-    # We need strikes from (ATM - 2*gap) to (ATM + num_levels*gap) for finding true ATM and calculating levels
-    strikes_needed = []
-    for offset in range(-2, num_levels + 3):  # Extra buffer for true ATM search
-        strikes_needed.append(approx_atm + (offset * strike_interval))
-
-    # Step 4: Fetch 5-min close prices for all required options
-    option_prices = {}  # {strike_CE: price, strike_PE: price}
-
-    for strike in strikes_needed:
-        ce_symbol = build_option_symbol(index, expiry_date, strike, "CE")
-        pe_symbol = build_option_symbol(index, expiry_date, strike, "PE")
-
-        try:
-            ce_close = get_5min_candle_close(client, ce_symbol, options_exchange)
-            option_prices[f"{strike}_CE"] = ce_close
-        except Exception as e:
-            print(f"[Levels] Warning: Could not get CE price for {strike}: {e}")
-            option_prices[f"{strike}_CE"] = 0.0
-
-        try:
-            pe_close = get_5min_candle_close(client, pe_symbol, options_exchange)
-            option_prices[f"{strike}_PE"] = pe_close
-        except Exception as e:
-            print(f"[Levels] Warning: Could not get PE price for {strike}: {e}")
-            option_prices[f"{strike}_PE"] = 0.0
-
-    # Step 5: Find TRUE ATM (strike where |CE - PE| is minimum)
-    min_diff = float('inf')
-    true_atm = approx_atm
-
-    for offset in range(-2, 3):  # Check ±2 strikes from approx ATM
-        strike = approx_atm + (offset * strike_interval)
-        ce_price = option_prices.get(f"{strike}_CE", 0)
-        pe_price = option_prices.get(f"{strike}_PE", 0)
-
-        if ce_price > 0 and pe_price > 0:
-            diff = abs(ce_price - pe_price)
-            if diff < min_diff:
-                min_diff = diff
-                true_atm = strike
-
-    print(f"[Levels] TRUE ATM: {true_atm} (diff: {min_diff:.2f})")
-
-    # Step 6: Calculate BEP
-    atm_ce = option_prices.get(f"{true_atm}_CE", 0)
-    atm_pe = option_prices.get(f"{true_atm}_PE", 0)
-    bep = (atm_ce + atm_pe) / 2.0
-    print(f"[Levels] BEP: {bep:.2f} (ATM_CE: {atm_ce:.2f}, ATM_PE: {atm_pe:.2f})")
-
-    # Step 7: Calculate R1-R6
-    # R_n = ((ATM - n*gap)_CE + (ATM + n*gap)_PE) / 2
-    r_levels = []
-    for i in range(1, num_levels + 1):
-        ce_strike = true_atm - (i * strike_interval)  # Lower strike CE (more expensive)
-        pe_strike = true_atm + (i * strike_interval)  # Higher strike PE (more expensive)
-
-        ce_price = option_prices.get(f"{ce_strike}_CE", 0)
-        pe_price = option_prices.get(f"{pe_strike}_PE", 0)
-
-        r_value = (ce_price + pe_price) / 2.0
-        r_levels.append(round_to_tick(r_value))
-        print(f"[Levels] R{i}: {round_to_tick(r_value):.2f} (CE@{ce_strike}: {ce_price:.2f}, PE@{pe_strike}: {pe_price:.2f})")
-
-    # Pad with zeros if needed
-    while len(r_levels) < 6:
-        r_levels.append(0.0)
-
-    return ResistanceLevels(
-        bep=round_to_tick(bep),
-        r1=r_levels[0],
-        r2=r_levels[1],
-        r3=r_levels[2],
-        r4=r_levels[3],
-        r5=r_levels[4],
-        r6=r_levels[5],
-        true_atm=true_atm,
-        calculated_at=datetime.now()
-    )
+# REMOVED: Resistance levels calculation not needed in simplified version
+# Original function calculated R1-R6 levels using straddle/strangle pricing
+# Simplified version uses fixed 25-point target with breakeven SL instead
 
 
 def get_15min_candle(client: api, symbol: str, exchange: str) -> dict:
@@ -769,11 +757,20 @@ def get_15min_candle(client: api, symbol: str, exchange: str) -> dict:
 
 
 def calculate_quantity(capital: float, price: float, lot_size: int) -> int:
-    """Calculate quantity based on capital and lot size"""
-    if price <= 0:
+    """
+    Calculate quantity based on capital and lot size.
+
+    Returns 0 if insufficient capital or invalid inputs.
+    """
+    if price <= 0 or lot_size <= 0 or capital <= 0:
         return 0
+
     max_lots = int(capital / (price * lot_size))
-    return max(max_lots, 1) * lot_size  # At least 1 lot
+
+    if max_lots < 1:
+        return 0  # Insufficient capital for even 1 lot
+
+    return max_lots * lot_size
 
 
 def check_entry_condition_ws(
@@ -787,9 +784,9 @@ def check_entry_condition_ws(
     2. Current 1min candle: open AND close > entry_level
     3. Previous 1min candle: open OR close < entry_level (crossover)
     """
-    # Get LTP
+    # Get LTP and validate it's not zero/stale
     ltp = tick_manager.get_ltp(symbol)
-    if ltp <= entry_level:
+    if ltp <= 0 or ltp <= entry_level:
         return False
 
     # Get current candle
@@ -852,14 +849,14 @@ class OptionsAlphaStrategy:
         self.tick_manager.on_disconnect_callback = self._on_ws_disconnect
 
         # State
-        self.resistance_levels: Optional[ResistanceLevels] = None
         self.entry_levels: Optional[EntryLevels] = None
         self.position: Optional[Position] = None
         self.completed_trades: int = 0      # Tracks COMPLETED (exited) trades
         self.can_trade: bool = True          # Flag to control new entries
         self.daily_pnl: float = 0.0
-        self.trade_log: list = []
+        self.trades_dict: dict = {}          # Key: order_id, Value: complete trade info
         self.subscribed_symbols: List[dict] = []
+        self.allocated_capital: float = 0.0  # Capital allocated for trading (capped at 2L)
 
         # Crash recovery state
         self.crash_count: int = 0
@@ -868,6 +865,64 @@ class OptionsAlphaStrategy:
     def log(self, message: str):
         """Log message with timestamp"""
         self.logger.info(message)
+
+    def log_trade_to_excel(self, trade_data: dict):
+        """
+        Log trade details to Excel file for long-term performance tracking.
+        Creates file if it doesn't exist, appends new row otherwise.
+
+        Args:
+            trade_data: Dictionary with complete trade information
+        """
+        try:
+            excel_file = Path(EXCEL_LOG_FILE)
+
+            # Prepare row data with 9:30 calculated levels + trade execution details
+            row_data = {
+                "Date": datetime.now().strftime("%Y-%m-%d"),
+                "ATM Strike": self.entry_levels.atm_strike if self.entry_levels else "",
+                "PE Symbol": self.entry_levels.pe_symbol if self.entry_levels else "",
+                "PE Entry Level": self.entry_levels.pe_entry_level if self.entry_levels else "",
+                "CE Symbol": self.entry_levels.ce_symbol if self.entry_levels else "",
+                "CE Entry Level": self.entry_levels.ce_entry_level if self.entry_levels else "",
+                "Expiry": self.entry_levels.expiry_date if self.entry_levels else "",
+                "Entry Order ID": trade_data.get("entry_order_id", ""),
+                "Exit Order ID": trade_data.get("exit_order_id", ""),
+                "Trade Type": trade_data.get("option_type", ""),
+                "Traded Symbol": trade_data.get("symbol", ""),
+                "Entry Time": trade_data.get("entry_time", ""),
+                "Entry Price": trade_data.get("entry_price", 0.0),
+                "Initial SL": trade_data.get("initial_sl", 0.0),
+                "Target Price": trade_data.get("target_price", 0.0),
+                "Exit Time": trade_data.get("exit_time", ""),
+                "Exit Price": trade_data.get("exit_price", 0.0),
+                "Final SL": trade_data.get("final_sl", 0.0),
+                "Quantity": trade_data.get("quantity", 0),
+                "PnL": trade_data.get("pnl", 0.0),
+                "Exit Reason": trade_data.get("exit_reason", ""),
+                "Breakeven Activated": "Yes" if trade_data.get("breakeven_activated", False) else "No"
+            }
+
+            # Convert to DataFrame
+            new_row_df = pd.DataFrame([row_data])
+
+            # Append to existing file or create new one
+            if excel_file.exists():
+                # Read existing data
+                existing_df = pd.read_excel(excel_file, engine='openpyxl')
+                # Append new row
+                updated_df = pd.concat([existing_df, new_row_df], ignore_index=True)
+            else:
+                # Create new file
+                updated_df = new_row_df
+
+            # Write to Excel
+            updated_df.to_excel(excel_file, index=False, engine='openpyxl')
+            self.logger.debug(f"Trade logged to Excel: {excel_file}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to log trade to Excel: {e}")
+            # Don't raise - Excel logging failure shouldn't stop the strategy
 
     def _on_ws_reconnect(self):
         """Callback when WebSocket reconnects"""
@@ -913,62 +968,14 @@ class OptionsAlphaStrategy:
 
         self.log("Market is open!")
 
-    def wait_for_5min_candle_and_calculate_levels(self):
-        """Wait for first 5-min candle (9:20) and calculate R1-R6 levels"""
-        self.log("Waiting for first 5-min candle to close at 09:20...")
-
-        while True:
-            now = datetime.now()
-            candle_close = datetime.strptime(
-                f"{now.strftime('%Y-%m-%d')} 09:20",
-                "%Y-%m-%d %H:%M"
-            )
-
-            if now >= candle_close:
-                break
-
-            time.sleep(5)
-
-        # Wait a bit for data to be available
-        time.sleep(5)
-        self.log("First 5-min candle closed! Calculating resistance levels...")
-
-        # Get expiry date first (needed for level calculation)
-        expiry_date = get_expiry_date(
-            self.client,
-            self.config.INDEX,
-            self.options_exchange,
-            self.config.EXPIRY_WEEK
-        )
-        self.log(f"Using expiry: {expiry_date}")
-
-        # Calculate resistance levels
-        self.resistance_levels = calculate_resistance_levels(
-            client=self.client,
-            index=self.config.INDEX,
-            index_exchange=self.index_exchange,
-            options_exchange=self.options_exchange,
-            strike_interval=self.strike_interval,
-            expiry_date=expiry_date,
-            num_levels=self.config.NUM_RESISTANCE_LEVELS
-        )
-
-        self.log("=" * 50)
-        self.log("RESISTANCE LEVELS (Static for today)")
-        self.log("=" * 50)
-        self.log(f"TRUE ATM: {self.resistance_levels.true_atm}")
-        self.log(f"BEP: {self.resistance_levels.bep:.2f}")
-        self.log(f"R1: {self.resistance_levels.r1:.2f}")
-        self.log(f"R2: {self.resistance_levels.r2:.2f}")
-        self.log(f"R3: {self.resistance_levels.r3:.2f}")
-        self.log(f"R4: {self.resistance_levels.r4:.2f}")
-        self.log(f"R5: {self.resistance_levels.r5:.2f}")
-        self.log(f"R6: {self.resistance_levels.r6:.2f}")
-        self.log("=" * 50)
+    # REMOVED: Not needed in simplified version - no resistance levels
+    # def wait_for_5min_candle_and_calculate_levels(self):
+    #     """Wait for first 5-min candle (9:20) and calculate R1-R6 levels"""
+    #     pass
 
     def wait_for_first_candle(self):
         """Wait for first 15-min candle to complete (9:30)"""
-        self.log(f"Waiting for first 15-min candle to close at {self.config.FIRST_CANDLE_CLOSE}...")
+        self.log(f"Waiting for 9:30...")
 
         while True:
             now = datetime.now()
@@ -982,27 +989,11 @@ class OptionsAlphaStrategy:
 
             time.sleep(5)
 
-        # Wait a bit more for data to be available
         time.sleep(10)
-        self.log("First 15-min candle closed!")
+        self.log("9:30 candle closed")
 
     def calculate_entry_levels(self) -> EntryLevels:
-        """Calculate ATM strike and entry levels from first 15-min candle"""
-        self.log("Calculating entry levels...")
-
-        # Get first 15-min candle of index
-        index_candle = get_15min_candle(
-            self.client,
-            self.config.INDEX,
-            self.index_exchange
-        )
-        spot_close = index_candle["close"]
-        self.log(f"{self.config.INDEX} first 15-min candle close: {spot_close}")
-
-        # Calculate ATM strike
-        atm_strike = get_nearest_strike(spot_close, self.strike_interval)
-        self.log(f"ATM Strike: {atm_strike}")
-
+        """Calculate ATM strike and entry levels using OpenAlgo optionsymbol API"""
         # Get expiry date
         expiry_date = get_expiry_date(
             self.client,
@@ -1010,33 +1001,59 @@ class OptionsAlphaStrategy:
             self.options_exchange,
             self.config.EXPIRY_WEEK
         )
-        self.log(f"Expiry Date: {expiry_date}")
 
-        # Build option symbols
-        pe_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "PE")
-        ce_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "CE")
-        self.log(f"PE Symbol: {pe_symbol}, CE Symbol: {ce_symbol}")
+        # Use optionsymbol API to get ATM PE (auto-calculates ATM strike)
+        pe_result = self.client.optionsymbol(
+            underlying=self.config.INDEX,
+            exchange=self.index_exchange,
+            expiry_date=expiry_date,
+            offset="ATM",
+            option_type="PE"
+        )
 
-        # Get lot size
-        lot_size = get_lot_size(self.client, ce_symbol, self.options_exchange)
-        self.log(f"Lot Size: {lot_size}")
+        if pe_result.get("status") != "success":
+            raise Exception(f"Failed to get PE symbol: {pe_result.get('message')}")
+
+        pe_data = pe_result.get("data", {})
+        pe_symbol = pe_data.get("symbol")
+        lot_size = pe_data.get("lotsize")
+        underlying_ltp = pe_data.get("underlying_ltp")
+
+        # Use optionsymbol API to get ATM CE
+        ce_result = self.client.optionsymbol(
+            underlying=self.config.INDEX,
+            exchange=self.index_exchange,
+            expiry_date=expiry_date,
+            offset="ATM",
+            option_type="CE"
+        )
+
+        if ce_result.get("status") != "success":
+            raise Exception(f"Failed to get CE symbol: {ce_result.get('message')}")
+
+        ce_data = ce_result.get("data", {})
+        ce_symbol = ce_data.get("symbol")
+
+        # Extract ATM strike from symbol with error handling
+        try:
+            # Format: NIFTY28NOV2522500PE -> remove last 2 chars (PE), split by expiry, get strike
+            symbol_parts = pe_symbol[:-2].split(expiry_date)
+            if len(symbol_parts) < 2:
+                raise ValueError(f"Invalid PE symbol format: {pe_symbol}")
+            atm_strike = int(symbol_parts[1])
+        except (ValueError, IndexError) as e:
+            raise Exception(f"Failed to extract ATM strike from symbol {pe_symbol}: {e}")
 
         # Get first 15-min candle for PE and CE
         pe_candle = get_15min_candle(self.client, pe_symbol, self.options_exchange)
         ce_candle = get_15min_candle(self.client, ce_symbol, self.options_exchange)
 
-        self.log(f"PE 15-min candle: Low={pe_candle['low']}, High={pe_candle['high']}")
-        self.log(f"CE 15-min candle: Low={ce_candle['low']}, High={ce_candle['high']}")
-
         # Calculate entry levels
-        # PE_entry_level = Avg(PE 15min low, CE 15min high)
         pe_entry_level = (pe_candle["low"] + ce_candle["high"]) / 2
-
-        # CE_entry_level = Avg(CE 15min low, CE 15min high)
         ce_entry_level = (ce_candle["low"] + ce_candle["high"]) / 2
 
-        self.log(f"PE Entry Level: {pe_entry_level:.2f}")
-        self.log(f"CE Entry Level: {ce_entry_level:.2f}")
+        self.log(f"Setup: {expiry_date} | ATM: {atm_strike} | Spot: {underlying_ltp:.2f}")
+        self.log(f"Entry Levels → PE: {pe_entry_level:.2f} | CE: {ce_entry_level:.2f}")
 
         return EntryLevels(
             atm_strike=atm_strike,
@@ -1050,23 +1067,18 @@ class OptionsAlphaStrategy:
 
     def setup_websocket(self):
         """Setup WebSocket subscription for PE and CE symbols"""
-        self.log("Setting up WebSocket connection...")
-
         self.subscribed_symbols = [
             {"exchange": self.options_exchange, "symbol": self.entry_levels.pe_symbol},
             {"exchange": self.options_exchange, "symbol": self.entry_levels.ce_symbol}
         ]
 
         self.tick_manager.subscribe(self.subscribed_symbols)
+        time.sleep(2)  # Wait for initial ticks
 
-        # Wait for initial ticks
-        self.log("Waiting for initial tick data...")
-        time.sleep(3)
-
-        # Verify we're receiving data
+        # Verify data
         pe_ltp = self.tick_manager.get_ltp(self.entry_levels.pe_symbol)
         ce_ltp = self.tick_manager.get_ltp(self.entry_levels.ce_symbol)
-        self.log(f"Initial LTP - PE: {pe_ltp:.2f}, CE: {ce_ltp:.2f}")
+        self.log(f"WebSocket ready | PE: {pe_ltp:.2f} | CE: {ce_ltp:.2f}")
 
     def cleanup_websocket(self):
         """Cleanup WebSocket connection"""
@@ -1074,13 +1086,32 @@ class OptionsAlphaStrategy:
             self.tick_manager.unsubscribe(self.subscribed_symbols)
         self.tick_manager.disconnect()
 
-    def get_available_capital(self) -> float:
-        """Get available capital from account"""
+    def initialize_capital(self):
+        """
+        Initialize capital with 2L cap - called once at start.
+
+        If available capital > 2.5L, cap at 2L.
+        Otherwise use configured percentage of available capital.
+        """
         result = self.client.funds()
         if result.get("status") == "success":
             available = float(result.get("data", {}).get("availablecash", 0))
-            return available * self.config.CAPITAL_PERCENT
-        return 0.0
+            capital_with_percent = available * self.config.CAPITAL_PERCENT
+
+            # If capital > 2.5L, cap at 2L
+            if capital_with_percent > 250000:
+                self.allocated_capital = 200000
+                self.log(f"Capital capped: Available ₹{available:,.0f} → Using ₹2,00,000")
+            else:
+                self.allocated_capital = capital_with_percent
+                self.log(f"Capital allocated: ₹{self.allocated_capital:,.0f} ({self.config.CAPITAL_PERCENT*100:.0f}% of ₹{available:,.0f})")
+        else:
+            self.allocated_capital = 0.0
+            self.log("Failed to fetch capital - cannot trade")
+
+    def get_available_capital(self) -> float:
+        """Get allocated capital (already capped and set at start)"""
+        return self.allocated_capital
 
     def get_ltp_http(self, symbol: str, exchange: str) -> float:
         """
@@ -1148,36 +1179,79 @@ class OptionsAlphaStrategy:
         self.logger.error(f"Failed to get LTP for {symbol} (both WS and HTTP failed)")
         return 0.0
 
+    def get_fill_price_from_tradebook(self, order_id: str) -> tuple[float, int]:
+        """
+        Get actual fill price and quantity from tradebook.
+
+        Args:
+            order_id: Order ID to lookup
+
+        Returns:
+            tuple: (avg_price, filled_qty)
+        """
+        try:
+            result = self.client.tradebook()
+            if result.get("status") == "success":
+                trades = result.get("data", [])
+
+                # Find all trades matching this order_id
+                matching_trades = [t for t in trades if t.get("orderid") == order_id]
+
+                if matching_trades:
+                    # Calculate weighted average price
+                    total_value = 0
+                    total_qty = 0
+
+                    for trade in matching_trades:
+                        qty = int(trade.get("quantity", 0))
+                        price = float(trade.get("price", 0))
+                        total_value += price * qty
+                        total_qty += qty
+
+                    if total_qty > 0:
+                        avg_price = total_value / total_qty
+                        return round_to_tick(avg_price), total_qty
+
+        except Exception as e:
+            self.logger.error(f"Error fetching tradebook: {e}")
+
+        return 0.0, 0
+
     def verify_order_executed(
         self,
         order_id: str,
         expected_action: str,
         max_wait_seconds: int = 10,
-        check_interval: float = 0.5
+        check_interval: float = 1.0
     ) -> dict:
         """
-        Verify order execution status.
+        Verify order execution status and fetch actual fill price from tradebook.
 
         Args:
             order_id: Order ID to check
             expected_action: Expected action (BUY/SELL)
             max_wait_seconds: Maximum time to wait for execution
-            check_interval: Time between status checks
+            check_interval: Time between status checks (default 1 second)
 
         Returns:
             dict with keys:
                 - executed: bool
                 - status: str (order status)
                 - filled_qty: int
-                - avg_price: float
+                - avg_price: float (from tradebook)
                 - message: str
         """
+        # Initial wait for order to hit exchange
+        time.sleep(1)
+
         start_time = time.time()
         last_status = "UNKNOWN"
+        verification_count = 0
 
         self.log(f"Verifying order {order_id}...")
 
         while (time.time() - start_time) < max_wait_seconds:
+            verification_count += 1
             try:
                 result = self.client.orderstatus(order_id=order_id)
 
@@ -1186,24 +1260,32 @@ class OptionsAlphaStrategy:
                     order_status = order_data.get("order_status", "").upper()
                     last_status = order_status
 
+                    self.logger.debug(f"Verification #{verification_count}: {order_status}")
+
                     # Check for completed/executed status
                     if order_status in ["COMPLETE", "COMPLETED", "FILLED", "EXECUTED"]:
-                        filled_qty = int(order_data.get("filled_quantity", order_data.get("quantity", 0)))
-                        avg_price = float(order_data.get("average_price", order_data.get("price", 0)))
+                        # Get actual fill price from tradebook
+                        avg_price, filled_qty = self.get_fill_price_from_tradebook(order_id)
 
-                        self.log(f"Order EXECUTED: Qty={filled_qty}, Avg Price={avg_price:.2f}")
+                        # Fallback to orderstatus if tradebook lookup fails
+                        if avg_price <= 0:
+                            filled_qty = int(order_data.get("filled_quantity", order_data.get("quantity", 0)))
+                            avg_price = float(order_data.get("average_price", order_data.get("price", 0)))
+                            avg_price = round_to_tick(avg_price)
+
+                        self.log(f"Order EXECUTED (attempt {verification_count}): Qty={filled_qty}, Avg Price={avg_price:.2f}")
                         return {
                             "executed": True,
                             "status": order_status,
                             "filled_qty": filled_qty,
-                            "avg_price": round_to_tick(avg_price),
+                            "avg_price": avg_price,
                             "message": "Order executed successfully"
                         }
 
                     # Check for rejected/cancelled
                     elif order_status in ["REJECTED", "CANCELLED", "CANCELED", "FAILED"]:
                         reject_reason = order_data.get("reject_reason", order_data.get("message", "Unknown"))
-                        self.logger.error(f"Order {order_status}: {reject_reason}")
+                        self.logger.error(f"Order {order_status} (attempt {verification_count}): {reject_reason}")
                         return {
                             "executed": False,
                             "status": order_status,
@@ -1216,21 +1298,21 @@ class OptionsAlphaStrategy:
                     self.logger.debug(f"Order status: {order_status}, waiting...")
 
                 else:
-                    self.logger.warning(f"orderstatus API error: {result.get('message')}")
+                    self.logger.warning(f"orderstatus API error (attempt {verification_count}): {result.get('message')}")
 
             except Exception as e:
-                self.logger.error(f"Error checking order status: {e}")
+                self.logger.error(f"Error checking order status (attempt {verification_count}): {e}")
 
             time.sleep(check_interval)
 
         # Timeout
-        self.logger.warning(f"Order verification timeout. Last status: {last_status}")
+        self.logger.warning(f"Order verification timeout after {verification_count} attempts. Last status: {last_status}")
         return {
             "executed": False,
             "status": last_status,
             "filled_qty": 0,
             "avg_price": 0.0,
-            "message": f"Timeout waiting for order execution. Last status: {last_status}"
+            "message": f"Timeout waiting for order execution after {verification_count} attempts. Last status: {last_status}"
         }
 
     def place_order(self, option_type: Literal["CE", "PE"], entry_price: float) -> Optional[Position]:
@@ -1246,7 +1328,7 @@ class OptionsAlphaStrategy:
             self.log("Insufficient capital for order")
             return None
 
-        self.log(f"Placing {option_type} BUY order: {symbol} @ ~{entry_price:.2f}, Qty: {quantity}")
+        # Order placement (silent for speed)
 
         # Place order
         result = self.client.placeorder(
@@ -1285,7 +1367,7 @@ class OptionsAlphaStrategy:
 
         # Calculate SL and Target (rounded to tick size)
         sl_price = round_to_tick(entry_level * (1 - self.config.SL_PERCENT))
-        target_price = round_to_tick(actual_price * self.config.TARGET_MULTIPLIER)
+        target_price = round_to_tick(actual_price + self.config.TARGET_POINTS)
 
         position = Position(
             option_type=option_type,
@@ -1297,32 +1379,27 @@ class OptionsAlphaStrategy:
             entry_time=datetime.now(),
             order_id=order_id,
             cost_basis=actual_price * filled_qty,
-            current_r_level=0
+            breakeven_activated=False,
+            strategy_tag=self.config.STRATEGY_NAME,
+            initial_sl=sl_price  # Store initial SL for trade record
         )
 
-        self.log(f"Position CONFIRMED: Entry={actual_price:.2f}, Qty={filled_qty}, SL={sl_price:.2f}, Target={target_price:.2f}")
-
-        # Log R levels for reference
-        if self.resistance_levels:
-            self.log(f"Trail levels: R1={self.resistance_levels.r1:.2f}, R2={self.resistance_levels.r2:.2f}, "
-                     f"R3={self.resistance_levels.r3:.2f}, R4={self.resistance_levels.r4:.2f}")
+        self.log(f"✓ POSITION: {option_type} {symbol} | Entry: {actual_price:.2f} | Qty: {filled_qty} | SL: {sl_price:.2f} | Tgt: {target_price:.2f}")
         return position
+
+    # REMOVED: verify_position_exists() - too slow for scalping
+    # Trust our internal tracking for speed
 
     def manage_position(self) -> bool:
         """
-        Manage active position with level-based trailing SL using WebSocket data.
+        Manage active position with breakeven trailing SL using WebSocket data.
 
         Trailing Logic:
-        - LTP touches R1 → SL moves to R1 × (1 - SL_BUFFER_PERCENT)
-        - LTP touches R2 → SL moves to R2 × (1 - SL_BUFFER_PERCENT)
-        - ... and so on for R3-R6
+        - When profit reaches 20 points → move SL to cost (breakeven)
 
         Returns True if position is closed, False otherwise.
         """
         if not self.position:
-            return False
-
-        if not self.resistance_levels:
             return False
 
         # Get LTP with WebSocket + HTTP fallback (critical for SL/target)
@@ -1334,44 +1411,37 @@ class OptionsAlphaStrategy:
         current_value = ltp * self.position.quantity
         pnl = current_value - self.position.cost_basis
         pnl_percent = (pnl / self.position.cost_basis) * 100
+        pnl_points = ltp - self.position.entry_price
 
         # Check target hit
         if ltp >= self.position.target_price:
-            self.log(f"TARGET HIT! LTP: {ltp:.2f}, Target: {self.position.target_price:.2f}")
+            self.log(f"✓ TARGET HIT @ {ltp:.2f} (+{pnl_points:.1f}pts)")
             return self.close_position("TARGET")
 
         # Check SL hit
         if ltp <= self.position.sl_price:
-            self.log(f"SL HIT! LTP: {ltp:.2f}, SL: {self.position.sl_price:.2f}")
+            self.log(f"✗ SL HIT @ {ltp:.2f} ({pnl_points:.1f}pts)")
             return self.close_position("STOPLOSS")
 
-        # Level-based Trailing SL logic
-        # Check each R level from current+1 to R6
-        r_levels = self.resistance_levels.get_all_levels()  # [R1, R2, R3, R4, R5, R6]
+        # Breakeven Trailing SL logic
+        if not self.position.breakeven_activated and pnl_points >= self.config.BREAKEVEN_POINTS:
+            new_sl = round_to_tick(self.position.entry_price)
 
-        for level_num in range(self.position.current_r_level + 1, len(r_levels) + 1):
-            r_value = r_levels[level_num - 1]  # R1 is at index 0
-
-            # Check if LTP has touched this R level
-            if ltp >= r_value and r_value > 0:
-                # Calculate new SL (10% below this R level)
-                new_sl = round_to_tick(r_value * (1 - self.config.SL_BUFFER_PERCENT))
-
-                # Only update if new SL is higher than current SL
-                if new_sl > self.position.sl_price:
-                    old_sl = self.position.sl_price
-                    self.position.sl_price = new_sl
-                    self.position.current_r_level = level_num
-                    self.log(
-                        f"R{level_num} TOUCHED! LTP: {ltp:.2f}, R{level_num}: {r_value:.2f} | "
-                        f"SL moved: {old_sl:.2f} → {new_sl:.2f} (PnL: {pnl_percent:.1f}%)"
-                    )
+            if new_sl > self.position.sl_price:
+                self.position.sl_price = new_sl
+                self.position.breakeven_activated = True
+                self.log(f"⚡ BREAKEVEN @ +{pnl_points:.1f}pts | SL→{new_sl:.2f}")
 
         return False
 
     def close_position(self, reason: str, max_retries: int = 3) -> bool:
         """
         Robust position close method with retries.
+
+        IMPORTANT: This closes the position by placing an opposite order (SELL if we're LONG).
+        The broker will close the position using FIFO logic. Since this strategy only
+        creates ONE position at a time and tracks it by order_id, this is safe.
+        The verify_position_exists() check ensures we don't try to close manually-closed positions.
 
         Args:
             reason: Exit reason (STOPLOSS, TARGET, TIME_EXIT, MANUAL_EXIT, etc.)
@@ -1381,13 +1451,9 @@ class OptionsAlphaStrategy:
             True if position closed successfully, False otherwise
         """
         if not self.position:
-            self.log("No position to close")
             return False
 
-        self.log(f"{'='*50}")
-        self.log(f"CLOSING POSITION: {reason}")
-        self.log(f"Symbol: {self.position.symbol}, Qty: {self.position.quantity}")
-        self.log(f"{'='*50}")
+        self.log(f"Closing {self.position.option_type}: {reason}")
 
         # Store position details before closing
         symbol = self.position.symbol
@@ -1395,11 +1461,16 @@ class OptionsAlphaStrategy:
         entry_price = self.position.entry_price
         option_type = self.position.option_type
         entry_time = self.position.entry_time
-        r_level_reached = self.position.current_r_level
+        entry_order_id = self.position.order_id  # Store entry order ID (don't overwrite!)
+        initial_sl = self.position.initial_sl
+        target_price = self.position.target_price
+        breakeven_activated = self.position.breakeven_activated
+        final_sl = self.position.sl_price
 
         # Attempt to close with retries
         order_success = False
         exit_price = 0.0
+        exit_order_id = ""
 
         for attempt in range(1, max_retries + 1):
             self.log(f"Exit attempt {attempt}/{max_retries}...")
@@ -1416,11 +1487,11 @@ class OptionsAlphaStrategy:
                 )
 
                 if result.get("status") == "success":
-                    order_id = result.get("orderid", "")
-                    self.log(f"Exit order placed! Order ID: {order_id}")
+                    exit_order_id = result.get("orderid", "")
+                    self.log(f"Exit order placed! Order ID: {exit_order_id}")
 
                     # Verify order execution
-                    verification = self.verify_order_executed(order_id, "SELL")
+                    verification = self.verify_order_executed(exit_order_id, "SELL")
 
                     if verification["executed"]:
                         order_success = True
@@ -1464,20 +1535,28 @@ class OptionsAlphaStrategy:
         pnl = (exit_price - entry_price) * quantity
         self.daily_pnl += pnl
 
-        # Record trade
+        # Record trade in dictionary (key: entry_order_id)
         trade_record = {
+            "entry_order_id": entry_order_id,
+            "exit_order_id": exit_order_id,
             "symbol": symbol,
             "option_type": option_type,
+            "entry_time": entry_time.strftime("%H:%M:%S"),
             "entry_price": entry_price,
+            "initial_sl": initial_sl,
+            "target_price": target_price,
+            "exit_time": datetime.now().strftime("%H:%M:%S"),
             "exit_price": exit_price,
+            "final_sl": final_sl,
             "quantity": quantity,
             "pnl": pnl,
             "exit_reason": reason,
-            "entry_time": entry_time.strftime("%H:%M:%S"),
-            "exit_time": datetime.now().strftime("%H:%M:%S"),
-            "r_level_reached": r_level_reached
+            "breakeven_activated": breakeven_activated
         }
-        self.trade_log.append(trade_record)
+        self.trades_dict[entry_order_id] = trade_record
+
+        # Log trade to Excel for long-term tracking
+        self.log_trade_to_excel(trade_record)
 
         # Clear position
         self.position = None
@@ -1486,9 +1565,8 @@ class OptionsAlphaStrategy:
         self.completed_trades += 1
 
         # Log summary
-        pnl_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
-        self.log(f"Position CLOSED: Entry={entry_price:.2f}, Exit={exit_price:.2f}, PnL={pnl_str}")
-        self.log(f"Completed trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
+        pnl_str = f"+₹{pnl:.2f}" if pnl >= 0 else f"₹{pnl:.2f}"
+        self.log(f"✓ EXIT @ {exit_price:.2f} | PnL: {pnl_str} | Trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
 
         # Check if max trades reached - stop new entries
         if self.completed_trades >= self.config.MAX_COMPLETED_TRADES:
@@ -1524,23 +1602,44 @@ class OptionsAlphaStrategy:
         return now < cutoff_time
 
     def print_summary(self):
-        """Print end of day summary"""
-        self.log("=" * 60)
-        self.log("END OF DAY SUMMARY")
-        self.log("=" * 60)
-        self.log(f"Index: {self.config.INDEX}")
-        self.log(f"ATM Strike: {self.entry_levels.atm_strike if self.entry_levels else 'N/A'}")
+        """Print comprehensive end-of-day summary"""
+        self.log("=" * 70)
+        self.log("DAY SUMMARY")
+        self.log("=" * 70)
+        self.log(f"Index: {self.config.INDEX} | ATM Strike: {self.entry_levels.atm_strike if self.entry_levels else 'N/A'}")
         self.log(f"Completed Trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
-        self.log(f"Daily PnL: {self.daily_pnl:.2f}")
-        self.log("-" * 60)
 
-        for i, trade in enumerate(self.trade_log, 1):
-            self.log(f"Trade {i}: {trade['option_type']} {trade['symbol']}")
-            self.log(f"  Entry: {trade['entry_price']:.2f} @ {trade['entry_time']}")
-            self.log(f"  Exit: {trade['exit_price']:.2f} @ {trade['exit_time']} ({trade['exit_reason']})")
-            self.log(f"  PnL: {trade['pnl']:.2f}")
+        # Calculate win/loss stats
+        if self.trades_dict:
+            wins = sum(1 for t in self.trades_dict.values() if t['pnl'] > 0)
+            losses = sum(1 for t in self.trades_dict.values() if t['pnl'] < 0)
+            win_rate = (wins / len(self.trades_dict) * 100) if self.trades_dict else 0
+            self.log(f"Win Rate: {wins}W / {losses}L ({win_rate:.1f}%)")
 
-        self.log("=" * 60)
+        pnl_color = "+" if self.daily_pnl >= 0 else ""
+        self.log(f"Daily PnL: {pnl_color}₹{self.daily_pnl:.2f}")
+        self.log("=" * 70)
+
+        if not self.trades_dict:
+            self.log("No trades executed today")
+        else:
+            for i, (entry_order_id, trade) in enumerate(self.trades_dict.items(), 1):
+                pnl_sign = "+" if trade['pnl'] >= 0 else ""
+                be_flag = " [BE]" if trade['breakeven_activated'] else ""
+
+                self.log(f"\nTrade #{i} ({trade['exit_reason']})")
+                self.log(f"  Entry Order : {entry_order_id}")
+                self.log(f"  Exit Order  : {trade.get('exit_order_id', 'N/A')}")
+                self.log(f"  Symbol      : {trade['option_type']} {trade['symbol']}")
+                self.log(f"  Entry Time  : {trade['entry_time']} @ ₹{trade['entry_price']:.2f}")
+                self.log(f"  Initial SL  : ₹{trade['initial_sl']:.2f}")
+                self.log(f"  Target      : ₹{trade['target_price']:.2f}")
+                self.log(f"  Exit Time   : {trade['exit_time']} @ ₹{trade['exit_price']:.2f}")
+                self.log(f"  Final SL    : ₹{trade['final_sl']:.2f}{be_flag}")
+                self.log(f"  Quantity    : {trade['quantity']}")
+                self.log(f"  PnL         : {pnl_sign}₹{trade['pnl']:.2f}")
+
+        self.log("=" * 70)
 
     def print_status(self):
         """Print current status (called periodically)"""
@@ -1556,13 +1655,10 @@ class OptionsAlphaStrategy:
         if self.position:
             pos_ltp = self.get_ltp_with_fallback(self.position.symbol)
             pnl = (pos_ltp - self.position.entry_price) * self.position.quantity if pos_ltp > 0 else 0
-            r_level = f"R{self.position.current_r_level}" if self.position.current_r_level > 0 else "Entry"
-            status += f" | POS: {self.position.option_type} LTP: {pos_ltp:.2f} PnL: {pnl:.2f} SL: {self.position.sl_price:.2f} [{r_level}]"
-
-            # Show next R level to watch
-            if self.resistance_levels and self.position.current_r_level < 6:
-                next_r = self.resistance_levels.get_level(self.position.current_r_level + 1)
-                status += f" Next: R{self.position.current_r_level + 1}={next_r:.2f}"
+            pnl_points = pos_ltp - self.position.entry_price if pos_ltp > 0 else 0
+            be_status = "[BE]" if self.position.breakeven_activated else ""
+            status += f" | POS: {self.position.option_type} LTP: {pos_ltp:.2f} (+{pnl_points:.1f}pts) PnL: {pnl:.2f} SL: {self.position.sl_price:.2f} {be_status}"
+            status += f" Tgt: {self.position.target_price:.2f}"
 
         self.log(status)
 
@@ -1580,10 +1676,9 @@ class OptionsAlphaStrategy:
                     raise
 
     def run(self):
-        """Main strategy loop with robust error handling"""
+        """Main strategy loop - optimized for speed (25pt scalping)"""
         self.running = True
-        self.log(f"Starting {self.config.STRATEGY_NAME} Strategy for {self.config.INDEX} (WebSocket v3.0)")
-        self.log(f"Robustness: reconnect_attempts={MAX_RECONNECT_ATTEMPTS}, health_check={HEALTH_CHECK_INTERVAL}s")
+        self.log(f"Starting {self.config.STRATEGY_NAME} for {self.config.INDEX} | Target: +25pts | BE: 20pts")
 
         try:
             # FIRST: Check market hours (local check, no API needed)
@@ -1606,14 +1701,14 @@ class OptionsAlphaStrategy:
             # Wait for market open (if before 9:15)
             self.wait_for_market_open()
 
-            # Wait for first 5-min candle (9:20) and calculate R1-R6 levels
-            self.safe_execute(
-                self.wait_for_5min_candle_and_calculate_levels,
-                "Calculate resistance levels"
-            )
-
             # Wait for first 15-min candle (9:30)
             self.wait_for_first_candle()
+
+            # Initialize capital allocation (check once at start, cap at 2L if > 2.5L)
+            self.initialize_capital()
+            if self.allocated_capital <= 0:
+                self.log("Insufficient capital - cannot trade. Exiting.")
+                return
 
             # Calculate entry levels (with retry)
             self.entry_levels = self.safe_execute(
@@ -1624,45 +1719,30 @@ class OptionsAlphaStrategy:
             # Setup WebSocket (with retry)
             self.safe_execute(self.setup_websocket, "Setup WebSocket")
 
-            # Main trading loop
-            self.log("Starting main trading loop (WebSocket mode)...")
-            last_status_time = datetime.now()
-            last_health_log = datetime.now()
-            status_interval = 30  # Print status every 30 seconds
+            # Main trading loop - optimized for speed
+            self.log("Trading loop active. Monitoring for entries...")
 
             while self.running:
                 try:
                     # Check force exit time (15:00)
                     if self.is_force_exit_time():
-                        self.log("FORCE EXIT TIME (15:00) reached!")
                         if self.position:
+                            self.log("Force exit time reached")
                             self.close_position("TIME_EXIT")
                         break
 
                     # Check WebSocket health
                     if self.tick_manager.state == ConnectionState.FAILED:
-                        self.logger.critical("WebSocket permanently failed - exiting strategy")
                         if self.position:
                             self.close_position("WS_FAILED")
                         break
 
-                    # Check if max completed trades reached (no position, can't trade)
+                    # Check if max completed trades reached - exit strategy
                     if not self.position and not self.can_trade:
-                        self.log("Max completed trades reached. Waiting for exit time...")
-                        time.sleep(60)  # Check every minute
-                        continue
+                        self.log("Max completed trades reached - exiting strategy")
+                        break
 
-                    # Log health status periodically
-                    if (datetime.now() - last_health_log).seconds >= 300:  # Every 5 mins
-                        self._log_health_status()
-                        last_health_log = datetime.now()
-
-                    # Print status periodically
-                    if (datetime.now() - last_status_time).seconds >= status_interval:
-                        self.print_status()
-                        last_status_time = datetime.now()
-
-                    # Skip trading logic if WebSocket is not connected
+                    # Skip if WebSocket not connected
                     if not self.tick_manager.connected:
                         time.sleep(1)
                         continue
@@ -1673,28 +1753,28 @@ class OptionsAlphaStrategy:
 
                     # If no position and new entries allowed, check entry conditions
                     elif self.is_new_entry_allowed():
-                        # Check PE entry condition
+                        # Check PE entry
                         if check_entry_condition_ws(
                             self.tick_manager,
                             self.entry_levels.pe_symbol,
                             self.entry_levels.pe_entry_level
                         ):
                             ltp = self.tick_manager.get_ltp(self.entry_levels.pe_symbol)
-                            self.log(f"PE Entry condition met! LTP: {ltp:.2f}")
+                            self.log(f"✓ PE ENTRY @ {ltp:.2f}")
                             self.position = self.place_order("PE", ltp)
 
-                        # Check CE entry condition
+                        # Check CE entry
                         elif check_entry_condition_ws(
                             self.tick_manager,
                             self.entry_levels.ce_symbol,
                             self.entry_levels.ce_entry_level
                         ):
                             ltp = self.tick_manager.get_ltp(self.entry_levels.ce_symbol)
-                            self.log(f"CE Entry condition met! LTP: {ltp:.2f}")
+                            self.log(f"✓ CE ENTRY @ {ltp:.2f}")
                             self.position = self.place_order("CE", ltp)
 
-                    # Small sleep to prevent CPU spinning (WebSocket handles the data)
-                    time.sleep(0.1)
+                    # Fast loop for scalping (50ms)
+                    time.sleep(0.05)
 
                 except Exception as loop_error:
                     self.logger.error(f"Error in main loop: {loop_error}")
@@ -1798,16 +1878,17 @@ def run_with_crash_recovery():
 
 if __name__ == "__main__":
     # Validate API key
-    if API_KEY == "your_api_key_here" or len(API_KEY) < 10:
+    if API_KEY == "YOUR_API_KEY_HERE" or len(API_KEY) < 10:
         print("=" * 60)
         print("ERROR: API key not configured!")
-        print("Edit the API_KEY variable at the top of this file")
-        print("Get your key from: http://127.0.0.1:5000/apikey")
+        print("Configure API key in ~/.config/openalgo/config.json")
+        print("Get your key from: http://127.0.0.1:5003/apikey")
         print("=" * 60)
         exit(1)
 
     print("=" * 60)
-    print("Options Alpha Strategy v3.0")
+    print("Options Alpha 25 - Simplified Version")
+    print("Target: Fixed 25 points | Breakeven SL at 20 points")
     print("Features: WebSocket, Auto-Reconnect, Crash Recovery")
     print("=" * 60)
 
