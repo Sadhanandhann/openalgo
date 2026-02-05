@@ -44,7 +44,7 @@ from blueprints.orders import orders_bp
 from blueprints.platforms import platforms_bp
 from blueprints.playground import playground_bp  # Import the API playground blueprint
 from blueprints.pnltracker import pnltracker_bp  # Import the pnl tracker blueprint
-from blueprints.python_strategy import python_strategy_bp  # Import the python strategy blueprint
+from blueprints.python_strategy import python_strategy_bp, initialize_with_app_context as init_python_strategy  # Import the python strategy blueprint
 from blueprints.react_app import (  # Import React frontend blueprint
     is_react_frontend_available,
     react_bp,
@@ -263,6 +263,9 @@ def create_app():
 
         # Initialize health monitoring (background daemon thread)
         init_health_monitoring(app)
+
+        # NOTE: Python strategy scheduler is initialized in setup_environment()
+        # AFTER database tables are created, to avoid "no such table" errors on fresh install
 
         # Auto-start Telegram bot if it was active (non-blocking)
         try:
@@ -507,6 +510,14 @@ def setup_environment(app):
 
         db_init_time = (time.time() - db_init_start) * 1000
         logger.debug(f"All databases initialized in parallel ({db_init_time:.0f}ms)")
+
+        # Initialize Python strategy scheduler (registers cron jobs for scheduled strategies)
+        # This must be AFTER database initialization to avoid "no such table" errors
+        try:
+            init_python_strategy()
+            logger.debug("Python strategy scheduler initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize Python strategy scheduler: {e}")
 
         # Initialize Flow scheduler
         try:
