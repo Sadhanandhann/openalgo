@@ -742,9 +742,9 @@ def check_entry_condition(
     if len(candles) < 3:
         return False
 
-    # [-2] (last completed candle): open AND close above entry level, must be green (close > open)
+    # [-2] (last completed candle): open AND close above entry level
     latest = candles.iloc[-2]
-    if not (latest["open"] > entry_level and latest["close"] > entry_level and latest["close"] > latest["open"]):
+    if not (latest["open"] > entry_level and latest["close"] > entry_level):
         return False
 
     # [-3] (candle before): open OR close below entry level (crossover)
@@ -794,8 +794,8 @@ class OptionsAlphaStrategy:
         # State
         self.entry_levels: Optional[EntryLevels] = None
         self.position: Optional[Position] = None
-        self.completed_trades: int = 0      # Tracks COMPLETED (exited) trades
-        self.can_trade: bool = True          # Flag to control new entries
+        self.completed_trades: int = self._get_todays_completed_trades()
+        self.can_trade: bool = self.completed_trades < self.config.MAX_COMPLETED_TRADES
         self.daily_pnl: float = 0.0
         self.trades_dict: dict = {}          # Key: order_id, Value: complete trade info
         self.subscribed_symbols: List[dict] = []
@@ -844,6 +844,25 @@ class OptionsAlphaStrategy:
 
         self._candle_cache[symbol] = df
         return df
+
+    def _get_todays_completed_trades(self) -> int:
+        """Read Excel trade log and count how many trades were completed today."""
+        try:
+            excel_file = Path(EXCEL_LOG_FILE)
+            if not excel_file.exists():
+                return 0
+            df = pd.read_excel(excel_file, engine='openpyxl')
+            if df.empty or "Date" not in df.columns:
+                return 0
+            today = datetime.now().strftime("%Y-%m-%d")
+            today_trades = df[df["Date"].astype(str) == today]
+            count = len(today_trades)
+            if count > 0:
+                self.log(f"Resuming: found {count} completed trade(s) today in Excel log")
+            return count
+        except Exception as e:
+            self.logger.warning(f"Could not read trade history from Excel: {e}")
+            return 0
 
     def log_trade_to_excel(self, trade_data: dict):
         """
@@ -1694,6 +1713,11 @@ class OptionsAlphaStrategy:
                 "Calculate entry levels"
             )
 
+            # Check if max trades already completed today (from Excel log)
+            if not self.can_trade:
+                self.log(f"Max trades ({self.config.MAX_COMPLETED_TRADES}) already completed today. Exiting.")
+                return
+
             # Setup WebSocket (with retry)
             self.safe_execute(self.setup_websocket, "Setup WebSocket")
 
@@ -1722,9 +1746,10 @@ class OptionsAlphaStrategy:
                             self.close_position("WS_FAILED")
                         break
 
-                    # Check if max completed trades reached - exit strategy
-                    if not self.position and not self.can_trade:
-                        self.log("Max completed trades reached - exiting strategy")
+                    # No position + no new entries possible = exit strategy
+                    if not self.position and (not self.can_trade or not self.is_new_entry_allowed()):
+                        reason = "Max completed trades reached" if not self.can_trade else "Past entry cutoff time"
+                        self.log(f"{reason}, no position running - exiting strategy")
                         break
 
                     # Skip if WebSocket not connected
