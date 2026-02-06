@@ -238,6 +238,9 @@ MAX_COMPLETED_TRADES = 2           # Max completed (exited) trades per day
 NO_NEW_ENTRY_TIME = "14:15"            # No new entries after this time
 FORCE_EXIT_TIME = "14:59"              # Force exit all positions at this time
 
+# Freeze Quantity (exchange limit per order)
+FREEZE_QTY = 1755                          # NIFTY freeze limit
+
 # Robustness Settings
 LOG_TO_FILE = True                     # Enable file logging
 LOG_DIR = "logs"                       # Log directory
@@ -338,7 +341,7 @@ class Position:
     sl_price: float                    # Current SL (can change with breakeven)
     target_price: float
     entry_time: datetime
-    order_id: str                      # Entry order ID (unique identifier)
+    order_ids: List[str]               # Entry order IDs (multiple if split)
     cost_basis: float                  # Total cost for PnL calculation
     breakeven_activated: bool = False  # Track if breakeven SL has been applied
     strategy_tag: str = ""             # Strategy name that created this position
@@ -1237,8 +1240,84 @@ class OptionsAlphaStrategy:
             "message": f"Timeout waiting for order execution after {verification_count} attempts. Last status: {last_status}"
         }
 
+    def _place_orders(self, symbol: str, action: str, quantity: int) -> dict:
+        """
+        Place order(s), using splitorder if quantity exceeds freeze limit.
+        Returns dict with 'order_ids' list and 'status'.
+        """
+        if quantity <= FREEZE_QTY:
+            result = self.client.placeorder(
+                strategy=self.config.STRATEGY_NAME,
+                symbol=symbol,
+                exchange=self.options_exchange,
+                action=action,
+                quantity=quantity,
+                price_type="MARKET",
+                product="MIS"
+            )
+            if result.get("status") == "success":
+                return {"status": "success", "order_ids": [result.get("orderid", "")]}
+            return {"status": "error", "message": result.get("message", ""), "order_ids": []}
+
+        # Quantity exceeds freeze limit — use splitorder
+        self.log(f"Qty {quantity} > freeze {FREEZE_QTY}, using splitorder")
+        result = self.client.splitorder(
+            strategy=self.config.STRATEGY_NAME,
+            symbol=symbol,
+            action=action,
+            exchange=self.options_exchange,
+            quantity=quantity,
+            splitsize=FREEZE_QTY,
+            price_type="MARKET",
+            product="MIS"
+        )
+
+        if result.get("status") == "success":
+            order_ids = [r["orderid"] for r in result.get("results", []) if r.get("status") == "success"]
+            failed = [r for r in result.get("results", []) if r.get("status") != "success"]
+            if failed:
+                self.logger.warning(f"{len(failed)} split orders failed: {failed}")
+            return {"status": "success" if order_ids else "error", "order_ids": order_ids}
+
+        return {"status": "error", "message": result.get("message", ""), "order_ids": []}
+
+    def _verify_all_orders(self, order_ids: List[str], action: str) -> dict:
+        """
+        Verify all order IDs and return aggregated result.
+        Returns: {executed: bool, total_qty: int, avg_price: float, verified_ids: [str]}
+        """
+        total_qty = 0
+        total_value = 0.0
+        verified_ids = []
+        failed_ids = []
+
+        for oid in order_ids:
+            v = self.verify_order_executed(oid, action)
+            if v["executed"]:
+                qty = v["filled_qty"]
+                price = v["avg_price"]
+                total_qty += qty
+                total_value += price * qty
+                verified_ids.append(oid)
+            else:
+                self.logger.error(f"Order {oid} not executed: {v['message']}")
+                failed_ids.append(oid)
+
+        if total_qty > 0:
+            avg_price = round_to_tick(total_value / total_qty)
+        else:
+            avg_price = 0.0
+
+        return {
+            "executed": total_qty > 0,
+            "total_qty": total_qty,
+            "avg_price": avg_price,
+            "verified_ids": verified_ids,
+            "failed_ids": failed_ids
+        }
+
     def place_order(self, option_type: Literal["CE", "PE"], entry_price: float) -> Optional[Position]:
-        """Place buy order and create position"""
+        """Place buy order(s) and create position. Splits if qty > freeze limit."""
         symbol = self.entry_levels.ce_symbol if option_type == "CE" else self.entry_levels.pe_symbol
         entry_level = self.entry_levels.ce_entry_level if option_type == "CE" else self.entry_levels.pe_entry_level
 
@@ -1250,34 +1329,23 @@ class OptionsAlphaStrategy:
             self.log("Insufficient capital for order")
             return None
 
-        # Order placement (silent for speed)
-
-        # Place order
-        result = self.client.placeorder(
-            strategy=self.config.STRATEGY_NAME,
-            symbol=symbol,
-            exchange=self.options_exchange,
-            action="BUY",
-            quantity=quantity,
-            price_type="MARKET",
-            product="MIS"
-        )
-
-        if result.get("status") != "success":
-            self.log(f"Order placement failed: {result.get('message')}")
+        # Place order(s)
+        result = self._place_orders(symbol, "BUY", quantity)
+        if result["status"] != "success" or not result["order_ids"]:
+            self.log(f"Order placement failed: {result.get('message', 'no orders placed')}")
             return None
 
-        order_id = result.get("orderid", "")
-        self.log(f"Order placed! Order ID: {order_id}")
+        order_ids = result["order_ids"]
+        self.log(f"Orders placed: {len(order_ids)} order(s) | IDs: {order_ids}")
 
-        # Verify order execution
-        verification = self.verify_order_executed(order_id, "BUY")
+        # Verify all orders
+        verification = self._verify_all_orders(order_ids, "BUY")
 
         if not verification["executed"]:
-            self.logger.error(f"BUY order not executed: {verification['message']}")
+            self.logger.error("No BUY orders executed")
             return None
 
-        # Use verified fill price (fallback to WebSocket LTP if not available)
+        # Use verified fill price
         actual_price = verification["avg_price"]
         if actual_price <= 0:
             actual_price = self.tick_manager.get_ltp(symbol)
@@ -1285,7 +1353,7 @@ class OptionsAlphaStrategy:
             actual_price = entry_price
 
         actual_price = round_to_tick(actual_price)
-        filled_qty = verification["filled_qty"] if verification["filled_qty"] > 0 else quantity
+        filled_qty = verification["total_qty"] if verification["total_qty"] > 0 else quantity
 
         # Calculate SL and Target (rounded to tick size)
         sl_price = round_to_tick(entry_level * (1 - self.config.SL_PERCENT))
@@ -1299,11 +1367,11 @@ class OptionsAlphaStrategy:
             sl_price=sl_price,
             target_price=target_price,
             entry_time=datetime.now(),
-            order_id=order_id,
+            order_ids=verification["verified_ids"],
             cost_basis=actual_price * filled_qty,
             breakeven_activated=False,
             strategy_tag=self.config.STRATEGY_NAME,
-            initial_sl=sl_price  # Store initial SL for trade record
+            initial_sl=sl_price
         )
 
         self.log(f"✓ POSITION: {option_type} {symbol} | Entry: {actual_price:.2f} | Qty: {filled_qty} | SL: {sl_price:.2f} | Tgt: {target_price:.2f}")
@@ -1358,12 +1426,7 @@ class OptionsAlphaStrategy:
 
     def close_position(self, reason: str, max_retries: int = 3) -> bool:
         """
-        Robust position close method with retries.
-
-        IMPORTANT: This closes the position by placing an opposite order (SELL if we're LONG).
-        The broker will close the position using FIFO logic. Since this strategy only
-        creates ONE position at a time and tracks it by order_id, this is safe.
-        The verify_position_exists() check ensures we don't try to close manually-closed positions.
+        Robust position close with retries. Uses splitorder if qty > freeze limit.
 
         Args:
             reason: Exit reason (STOPLOSS, TARGET, TIME_EXIT, MANUAL_EXIT, etc.)
@@ -1383,7 +1446,7 @@ class OptionsAlphaStrategy:
         entry_price = self.position.entry_price
         option_type = self.position.option_type
         entry_time = self.position.entry_time
-        entry_order_id = self.position.order_id  # Store entry order ID (don't overwrite!)
+        entry_order_ids = self.position.order_ids
         initial_sl = self.position.initial_sl
         target_price = self.position.target_price
         breakeven_activated = self.position.breakeven_activated
@@ -1392,28 +1455,20 @@ class OptionsAlphaStrategy:
         # Attempt to close with retries
         order_success = False
         exit_price = 0.0
-        exit_order_id = ""
+        exit_order_ids = []
 
         for attempt in range(1, max_retries + 1):
             self.log(f"Exit attempt {attempt}/{max_retries}...")
 
             try:
-                result = self.client.placeorder(
-                    strategy=self.config.STRATEGY_NAME,
-                    symbol=symbol,
-                    exchange=self.options_exchange,
-                    action="SELL",
-                    quantity=quantity,
-                    price_type="MARKET",
-                    product="MIS"
-                )
+                result = self._place_orders(symbol, "SELL", quantity)
 
-                if result.get("status") == "success":
-                    exit_order_id = result.get("orderid", "")
-                    self.log(f"Exit order placed! Order ID: {exit_order_id}")
+                if result["status"] == "success" and result["order_ids"]:
+                    exit_order_ids = result["order_ids"]
+                    self.log(f"Exit orders placed: {len(exit_order_ids)} order(s)")
 
-                    # Verify order execution
-                    verification = self.verify_order_executed(exit_order_id, "SELL")
+                    # Verify all exit orders
+                    verification = self._verify_all_orders(exit_order_ids, "SELL")
 
                     if verification["executed"]:
                         order_success = True
@@ -1431,17 +1486,17 @@ class OptionsAlphaStrategy:
                                 exit_price = entry_price
 
                         exit_price = round_to_tick(exit_price)
-                        self.log(f"Exit CONFIRMED at {exit_price:.2f}")
+                        self.log(f"Exit CONFIRMED at {exit_price:.2f} | Qty: {verification['total_qty']}")
                         break
                     else:
-                        self.logger.warning(f"Exit order not confirmed: {verification['message']}")
+                        self.logger.warning(f"Exit orders not confirmed: {verification.get('failed_ids', [])}")
                         if attempt < max_retries:
                             time.sleep(2)
 
                 else:
-                    self.log(f"Exit order placement failed: {result.get('message')}")
+                    self.log(f"Exit order placement failed: {result.get('message', '')}")
                     if attempt < max_retries:
-                        time.sleep(2)  # Wait before retry
+                        time.sleep(2)
 
             except Exception as e:
                 self.logger.error(f"Exit order exception: {e}")
@@ -1457,10 +1512,11 @@ class OptionsAlphaStrategy:
         pnl = (exit_price - entry_price) * quantity
         self.daily_pnl += pnl
 
-        # Record trade in dictionary (key: entry_order_id)
+        # Record trade
+        trade_key = entry_order_ids[0] if entry_order_ids else "unknown"
         trade_record = {
-            "entry_order_id": entry_order_id,
-            "exit_order_id": exit_order_id,
+            "entry_order_id": ", ".join(entry_order_ids),
+            "exit_order_id": ", ".join(exit_order_ids),
             "symbol": symbol,
             "option_type": option_type,
             "entry_time": entry_time.strftime("%H:%M:%S"),
@@ -1475,7 +1531,7 @@ class OptionsAlphaStrategy:
             "exit_reason": reason,
             "breakeven_activated": breakeven_activated
         }
-        self.trades_dict[entry_order_id] = trade_record
+        self.trades_dict[trade_key] = trade_record
 
         # Log trade to Excel for long-term tracking
         self.log_trade_to_excel(trade_record)
