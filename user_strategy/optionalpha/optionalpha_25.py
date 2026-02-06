@@ -136,7 +136,6 @@ import os
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, Literal, Dict, List, Callable
-from collections import deque
 from enum import Enum
 import traceback
 from pathlib import Path
@@ -156,17 +155,18 @@ class StrategyLogger:
         self.logger.setLevel(logging.DEBUG)
         self.logger.handlers = []  # Clear existing handlers
 
-        # Console handler (always enabled)
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        console_format = logging.Formatter(
-            '[%(asctime)s] %(levelname)s: %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        console_handler.setFormatter(console_format)
-        self.logger.addHandler(console_handler)
+        # Console handler (only if file logging is disabled)
+        if not log_to_file:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            console_format = logging.Formatter(
+                '[%(asctime)s] %(levelname)s: %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            console_handler.setFormatter(console_format)
+            self.logger.addHandler(console_handler)
 
-        # File handler (optional)
+        # File handler
         if log_to_file:
             os.makedirs(log_dir, exist_ok=True)
             log_file = os.path.join(
@@ -229,7 +229,7 @@ EXPIRY_WEEK = 1
 CAPITAL_PERCENT = 0.90             # Use 90% of available capital
 
 # Risk Management
-SL_PERCENT = 0.05                  # 5% stop loss below entry level
+SL_PERCENT = 0.07                  # 5% stop loss below entry level
 TARGET_POINTS = 25                 # Fixed 25-point profit target
 BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches this
 
@@ -239,7 +239,7 @@ NO_NEW_ENTRY_TIME = "14:15"            # No new entries after this time
 FORCE_EXIT_TIME = "14:59"              # Force exit all positions at this time
 
 # Robustness Settings
-LOG_TO_FILE = False                    # Enable file logging
+LOG_TO_FILE = True                     # Enable file logging
 LOG_DIR = "logs"                       # Log directory
 MAX_RECONNECT_ATTEMPTS = 10            # Max WebSocket reconnection attempts
 RECONNECT_BASE_DELAY = 2               # Initial reconnect delay (seconds)
@@ -346,24 +346,11 @@ class Position:
 
 
 @dataclass
-class Candle:
-    """1-minute candle structure"""
-    timestamp: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-
-
-@dataclass
 class TickData:
     """Real-time tick data for a symbol"""
     symbol: str
     ltp: float = 0.0
     timestamp: datetime = field(default_factory=datetime.now)
-    # 1-min candle tracking
-    current_candle: Optional[Candle] = None
-    candle_history: deque = field(default_factory=lambda: deque(maxlen=5))
 
 
 # =============================================================================
@@ -379,7 +366,6 @@ class TickManager:
         self.logger = logger
         self.ticks: Dict[str, TickData] = {}
         self.lock = threading.Lock()
-        self._current_minute: Dict[str, int] = {}
 
         # Connection state management
         self.state = ConnectionState.DISCONNECTED
@@ -398,52 +384,23 @@ class TickManager:
     def on_tick(self, data: dict):
         """Callback for WebSocket tick updates"""
         try:
-            ltp_data = data.get("ltp", {})
-            for _exchange, symbols in ltp_data.items():
-                for symbol, info in symbols.items():
-                    ltp = float(info.get("ltp", 0))
-                    if ltp > 0:
-                        self._update_tick(symbol, ltp)
-                        self.last_tick_time = datetime.now()
+            symbol = data.get("symbol")
+            market_data = data.get("data", {})
+            ltp = float(market_data.get("ltp", 0))
+            if symbol and ltp > 0:
+                self._update_tick(symbol, ltp)
+                self.last_tick_time = datetime.now()
         except Exception as e:
             self.logger.error(f"[TickManager] Error processing tick: {e}")
 
     def _update_tick(self, symbol: str, ltp: float):
-        """Update tick data and build 1-min candles"""
-        now = datetime.now()
-        current_minute = now.minute
-
+        """Update LTP for a symbol"""
         with self.lock:
             if symbol not in self.ticks:
                 self.ticks[symbol] = TickData(symbol=symbol)
-
             tick = self.ticks[symbol]
             tick.ltp = ltp
-            tick.timestamp = now
-
-            # Check if we need to start a new candle
-            prev_minute = self._current_minute.get(symbol, -1)
-
-            if current_minute != prev_minute:
-                # Save previous candle if exists
-                if tick.current_candle is not None:
-                    tick.candle_history.append(tick.current_candle)
-
-                # Start new candle
-                tick.current_candle = Candle(
-                    timestamp=now.replace(second=0, microsecond=0),
-                    open=ltp,
-                    high=ltp,
-                    low=ltp,
-                    close=ltp
-                )
-                self._current_minute[symbol] = current_minute
-            else:
-                # Update current candle
-                if tick.current_candle:
-                    tick.current_candle.high = max(tick.current_candle.high, ltp)
-                    tick.current_candle.low = min(tick.current_candle.low, ltp)
-                    tick.current_candle.close = ltp
+            tick.timestamp = datetime.now()
 
     def get_ltp(self, symbol: str) -> float:
         """Get current LTP for a symbol"""
@@ -458,20 +415,6 @@ class TickManager:
             if tick and tick.timestamp:
                 return (datetime.now() - tick.timestamp).total_seconds()
             return float('inf')
-
-    def get_last_candles(self, symbol: str, count: int = 2) -> List[Candle]:
-        """Get last N completed 1-min candles"""
-        with self.lock:
-            tick = self.ticks.get(symbol)
-            if not tick:
-                return []
-            return list(tick.candle_history)[-count:]
-
-    def get_current_candle(self, symbol: str) -> Optional[Candle]:
-        """Get current (incomplete) 1-min candle"""
-        with self.lock:
-            tick = self.ticks.get(symbol)
-            return tick.current_candle if tick else None
 
     def is_data_stale(self) -> bool:
         """Check if data is stale (no recent ticks)"""
@@ -679,7 +622,9 @@ def get_expiry_date(client: api, index: str, exchange: str, expiry_week: int) ->
 
     # expiry_dates are sorted, pick based on expiry_week
     idx = min(expiry_week - 1, len(expiry_dates) - 1)
-    return expiry_dates[idx]
+    # Expiry API returns DD-MMM-YY (e.g., 10-FEB-26) but optionsymbol API
+    # expects DDMMMYY (e.g., 10FEB26) — strip hyphens
+    return expiry_dates[idx].replace("-", "")
 
 
 def build_option_symbol(index: str, expiry_date: str, strike: int, option_type: str) -> str:
@@ -773,40 +718,35 @@ def calculate_quantity(capital: float, price: float, lot_size: int) -> int:
     return max_lots * lot_size
 
 
-def check_entry_condition_ws(
-    tick_manager: TickManager,
-    symbol: str,
+def check_entry_condition(
+    ltp: float,
+    candles: "pd.DataFrame",
     entry_level: float
 ) -> bool:
     """
-    Check entry condition using WebSocket data:
+    Check entry condition using LTP (WebSocket) + 1-min candles (API):
     1. LTP > entry_level
-    2. Current 1min candle: open AND close > entry_level
-    3. Previous 1min candle: open OR close < entry_level (crossover)
+    2. Last COMPLETED candle [-2]: open AND close > entry_level
+    3. Candle before that [-3]: open OR close < entry_level (crossover)
+
+    Note: [-1] is the in-progress candle (Dhan includes it) — skip it.
     """
-    # Get LTP and validate it's not zero/stale
-    ltp = tick_manager.get_ltp(symbol)
+    # WebSocket LTP must be above entry level
     if ltp <= 0 or ltp <= entry_level:
         return False
 
-    # Get current candle
-    curr_candle = tick_manager.get_current_candle(symbol)
-    if not curr_candle:
+    # Need at least 3 candles ([-1] is in-progress, we use [-2] and [-3])
+    if len(candles) < 3:
         return False
 
-    # Current candle: both open and close above entry level
-    if not (curr_candle.open > entry_level and curr_candle.close > entry_level):
+    # [-2] (last completed candle): open AND close above entry level, must be green (close > open)
+    latest = candles.iloc[-2]
+    if not (latest["open"] > entry_level and latest["close"] > entry_level and latest["close"] > latest["open"]):
         return False
 
-    # Get previous candle
-    prev_candles = tick_manager.get_last_candles(symbol, count=1)
-    if not prev_candles:
-        return False
-
-    prev_candle = prev_candles[-1]
-
-    # Previous candle: open OR close below entry level (crossover confirmation)
-    if not (prev_candle.open < entry_level or prev_candle.close < entry_level):
+    # [-3] (candle before): open OR close below entry level (crossover)
+    prev = candles.iloc[-3]
+    if not (prev["open"] < entry_level or prev["close"] < entry_level):
         return False
 
     return True
@@ -856,6 +796,10 @@ class OptionsAlphaStrategy:
         self.daily_pnl: float = 0.0
         self.trades_dict: dict = {}          # Key: order_id, Value: complete trade info
         self.subscribed_symbols: List[dict] = []
+
+        # 1-min candle cache (fetched from API, refreshed each minute)
+        self._candle_cache: Dict[str, "pd.DataFrame"] = {}
+        self._candle_cache_minute: int = -1
         self.allocated_capital: float = 0.0  # Capital allocated for trading (capped at 2L)
 
         # Crash recovery state
@@ -865,6 +809,38 @@ class OptionsAlphaStrategy:
     def log(self, message: str):
         """Log message with timestamp"""
         self.logger.info(message)
+
+    def get_1m_candles(self, symbol: str) -> "pd.DataFrame":
+        """
+        Get 1-min candles from history API with per-minute caching.
+        Returns cached data if already fetched this minute.
+        """
+        current_minute = datetime.now().minute
+
+        if current_minute != self._candle_cache_minute:
+            # New minute — refresh cache for all symbols
+            self._candle_cache.clear()
+            self._candle_cache_minute = current_minute
+
+        if symbol in self._candle_cache:
+            return self._candle_cache[symbol]
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        df = self.client.history(
+            symbol=symbol,
+            exchange=self.options_exchange,
+            interval="1m",
+            start_date=today,
+            end_date=today
+        )
+
+        if isinstance(df, dict) and df.get("status") == "error":
+            self.logger.warning(f"Failed to fetch 1m candles for {symbol}: {df.get('message')}")
+            import pandas as pd
+            df = pd.DataFrame()
+
+        self._candle_cache[symbol] = df
+        return df
 
     def log_trade_to_excel(self, trade_data: dict):
         """
@@ -993,7 +969,7 @@ class OptionsAlphaStrategy:
         self.log("9:30 candle closed")
 
     def calculate_entry_levels(self) -> EntryLevels:
-        """Calculate ATM strike and entry levels using OpenAlgo optionsymbol API"""
+        """Calculate ATM strike and entry levels using 9:30 candle close (static for the day)"""
         # Get expiry date
         expiry_date = get_expiry_date(
             self.client,
@@ -1002,7 +978,28 @@ class OptionsAlphaStrategy:
             self.config.EXPIRY_WEEK
         )
 
-        # Use optionsymbol API to get ATM PE (auto-calculates ATM strike)
+        # Get index first 15-min candle to determine ATM from 9:30 close (not live price)
+        today = datetime.now().strftime("%Y-%m-%d")
+        index_df = self.client.history(
+            symbol=self.config.INDEX,
+            exchange=self.index_exchange,
+            interval="15m",
+            start_date=today,
+            end_date=today
+        )
+        if isinstance(index_df, dict) and index_df.get("status") == "error":
+            raise Exception(f"Failed to fetch index 15m candle: {index_df.get('message')}")
+        if hasattr(index_df, 'empty') and index_df.empty:
+            raise Exception("No index 15m candle data")
+
+        spot_at_930 = float(index_df.iloc[0]["close"])
+        atm_strike = round(spot_at_930 / self.strike_interval) * self.strike_interval
+
+        # Build symbols from fixed 9:30 ATM strike
+        pe_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "PE")
+        ce_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "CE")
+
+        # Get lot size from optionsymbol API
         pe_result = self.client.optionsymbol(
             underlying=self.config.INDEX,
             exchange=self.index_exchange,
@@ -1010,39 +1007,7 @@ class OptionsAlphaStrategy:
             offset="ATM",
             option_type="PE"
         )
-
-        if pe_result.get("status") != "success":
-            raise Exception(f"Failed to get PE symbol: {pe_result.get('message')}")
-
-        pe_data = pe_result.get("data", {})
-        pe_symbol = pe_data.get("symbol")
-        lot_size = pe_data.get("lotsize")
-        underlying_ltp = pe_data.get("underlying_ltp")
-
-        # Use optionsymbol API to get ATM CE
-        ce_result = self.client.optionsymbol(
-            underlying=self.config.INDEX,
-            exchange=self.index_exchange,
-            expiry_date=expiry_date,
-            offset="ATM",
-            option_type="CE"
-        )
-
-        if ce_result.get("status") != "success":
-            raise Exception(f"Failed to get CE symbol: {ce_result.get('message')}")
-
-        ce_data = ce_result.get("data", {})
-        ce_symbol = ce_data.get("symbol")
-
-        # Extract ATM strike from symbol with error handling
-        try:
-            # Format: NIFTY28NOV2522500PE -> remove last 2 chars (PE), split by expiry, get strike
-            symbol_parts = pe_symbol[:-2].split(expiry_date)
-            if len(symbol_parts) < 2:
-                raise ValueError(f"Invalid PE symbol format: {pe_symbol}")
-            atm_strike = int(symbol_parts[1])
-        except (ValueError, IndexError) as e:
-            raise Exception(f"Failed to extract ATM strike from symbol {pe_symbol}: {e}")
+        lot_size = pe_result.get("lotsize", INDEX_CONFIG.get(self.config.INDEX, {}).get("lot_size", 1))
 
         # Get first 15-min candle for PE and CE
         pe_candle = get_15min_candle(self.client, pe_symbol, self.options_exchange)
@@ -1050,9 +1015,10 @@ class OptionsAlphaStrategy:
 
         # Calculate entry levels
         pe_entry_level = (pe_candle["low"] + ce_candle["high"]) / 2
-        ce_entry_level = (ce_candle["low"] + ce_candle["high"]) / 2
+        ce_entry_level = (ce_candle["low"] + pe_candle["high"]) / 2
 
-        self.log(f"Setup: {expiry_date} | ATM: {atm_strike} | Spot: {underlying_ltp:.2f}")
+        self.log(f"Setup: {expiry_date} | ATM: {atm_strike} (9:30 close: {spot_at_930:.2f})")
+        self.log(f"Symbols → PE: {pe_symbol} | CE: {ce_symbol}")
         self.log(f"Entry Levels → PE: {pe_entry_level:.2f} | CE: {ce_entry_level:.2f}")
 
         return EntryLevels(
@@ -1179,44 +1145,6 @@ class OptionsAlphaStrategy:
         self.logger.error(f"Failed to get LTP for {symbol} (both WS and HTTP failed)")
         return 0.0
 
-    def get_fill_price_from_tradebook(self, order_id: str) -> tuple[float, int]:
-        """
-        Get actual fill price and quantity from tradebook.
-
-        Args:
-            order_id: Order ID to lookup
-
-        Returns:
-            tuple: (avg_price, filled_qty)
-        """
-        try:
-            result = self.client.tradebook()
-            if result.get("status") == "success":
-                trades = result.get("data", [])
-
-                # Find all trades matching this order_id
-                matching_trades = [t for t in trades if t.get("orderid") == order_id]
-
-                if matching_trades:
-                    # Calculate weighted average price
-                    total_value = 0
-                    total_qty = 0
-
-                    for trade in matching_trades:
-                        qty = int(trade.get("quantity", 0))
-                        price = float(trade.get("price", 0))
-                        total_value += price * qty
-                        total_qty += qty
-
-                    if total_qty > 0:
-                        avg_price = total_value / total_qty
-                        return round_to_tick(avg_price), total_qty
-
-        except Exception as e:
-            self.logger.error(f"Error fetching tradebook: {e}")
-
-        return 0.0, 0
-
     def verify_order_executed(
         self,
         order_id: str,
@@ -1225,7 +1153,7 @@ class OptionsAlphaStrategy:
         check_interval: float = 1.0
     ) -> dict:
         """
-        Verify order execution status and fetch actual fill price from tradebook.
+        Verify order execution status and get fill price from orderstatus API.
 
         Args:
             order_id: Order ID to check
@@ -1238,7 +1166,7 @@ class OptionsAlphaStrategy:
                 - executed: bool
                 - status: str (order status)
                 - filled_qty: int
-                - avg_price: float (from tradebook)
+                - avg_price: float
                 - message: str
         """
         # Initial wait for order to hit exchange
@@ -1264,14 +1192,8 @@ class OptionsAlphaStrategy:
 
                     # Check for completed/executed status
                     if order_status in ["COMPLETE", "COMPLETED", "FILLED", "EXECUTED"]:
-                        # Get actual fill price from tradebook
-                        avg_price, filled_qty = self.get_fill_price_from_tradebook(order_id)
-
-                        # Fallback to orderstatus if tradebook lookup fails
-                        if avg_price <= 0:
-                            filled_qty = int(order_data.get("filled_quantity", order_data.get("quantity", 0)))
-                            avg_price = float(order_data.get("average_price", order_data.get("price", 0)))
-                            avg_price = round_to_tick(avg_price)
+                        filled_qty = int(order_data.get("quantity", 0))
+                        avg_price = round_to_tick(float(order_data.get("average_price", 0)))
 
                         self.log(f"Order EXECUTED (attempt {verification_count}): Qty={filled_qty}, Avg Price={avg_price:.2f}")
                         return {
@@ -1721,9 +1643,16 @@ class OptionsAlphaStrategy:
 
             # Main trading loop - optimized for speed
             self.log("Trading loop active. Monitoring for entries...")
+            last_status_log = time.time()
 
             while self.running:
                 try:
+                    # Periodic status log every 30 seconds
+                    now_ts = time.time()
+                    if now_ts - last_status_log >= 30:
+                        self.print_status()
+                        last_status_log = now_ts
+
                     # Check force exit time (15:00)
                     if self.is_force_exit_time():
                         if self.position:
@@ -1753,25 +1682,24 @@ class OptionsAlphaStrategy:
 
                     # If no position and new entries allowed, check entry conditions
                     elif self.is_new_entry_allowed():
+                        pe_ltp = self.tick_manager.get_ltp(self.entry_levels.pe_symbol)
+                        ce_ltp = self.tick_manager.get_ltp(self.entry_levels.ce_symbol)
+                        pe_candles = self.get_1m_candles(self.entry_levels.pe_symbol)
+                        ce_candles = self.get_1m_candles(self.entry_levels.ce_symbol)
+
                         # Check PE entry
-                        if check_entry_condition_ws(
-                            self.tick_manager,
-                            self.entry_levels.pe_symbol,
-                            self.entry_levels.pe_entry_level
+                        if check_entry_condition(
+                            pe_ltp, pe_candles, self.entry_levels.pe_entry_level
                         ):
-                            ltp = self.tick_manager.get_ltp(self.entry_levels.pe_symbol)
-                            self.log(f"✓ PE ENTRY @ {ltp:.2f}")
-                            self.position = self.place_order("PE", ltp)
+                            self.log(f"✓ PE ENTRY @ {pe_ltp:.2f}")
+                            self.position = self.place_order("PE", pe_ltp)
 
                         # Check CE entry
-                        elif check_entry_condition_ws(
-                            self.tick_manager,
-                            self.entry_levels.ce_symbol,
-                            self.entry_levels.ce_entry_level
+                        elif check_entry_condition(
+                            ce_ltp, ce_candles, self.entry_levels.ce_entry_level
                         ):
-                            ltp = self.tick_manager.get_ltp(self.entry_levels.ce_symbol)
-                            self.log(f"✓ CE ENTRY @ {ltp:.2f}")
-                            self.position = self.place_order("CE", ltp)
+                            self.log(f"✓ CE ENTRY @ {ce_ltp:.2f}")
+                            self.position = self.place_order("CE", ce_ltp)
 
                     # Fast loop for scalping (50ms)
                     time.sleep(0.05)
