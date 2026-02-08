@@ -1648,7 +1648,7 @@ class OptionsAlphaStrategy:
     def run(self):
         """Main strategy loop - optimized for speed (25pt scalping)"""
         self.running = True
-        self.log(f"Starting {self.config.STRATEGY_NAME} for {self.config.INDEX} | Target: +25pts | BE: 20pts")
+        self.log(f"Starting {self.config.STRATEGY_NAME} for {self.config.INDEX} | Target: +{self.config.TARGET_POINTS:.0f}pts | BE: {self.config.BREAKEVEN_POINTS:.0f}pts | SL: {self.config.SL_PERCENT*100:.0f}%")
 
         try:
             # FIRST: Check market hours (local check, no API needed)
@@ -1870,7 +1870,7 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print("Options Alpha 25 - Simplified Version")
-    print("Target: Fixed 25 points | Breakeven SL at 20 points")
+    print(f"Target: {TARGET_POINTS}pts | Breakeven SL: {BREAKEVEN_POINTS}pts | SL: {SL_PERCENT*100:.0f}%")
     print("Features: WebSocket, Auto-Reconnect, Crash Recovery")
     print("=" * 60)
 
