@@ -244,7 +244,7 @@ FREEZE_QTY = 1755                          # NIFTY freeze limit
 
 # Robustness Settings
 LOG_TO_FILE = True                     # Enable file logging
-LOG_DIR = "logs"                       # Log directory
+LOG_DIR = str(Path(__file__).parent / "logs")  # Absolute path for consistent location
 MAX_RECONNECT_ATTEMPTS = 10            # Max WebSocket reconnection attempts
 RECONNECT_BASE_DELAY = 2               # Initial reconnect delay (seconds)
 RECONNECT_MAX_DELAY = 60               # Max reconnect delay (seconds)
@@ -254,7 +254,7 @@ AUTO_RESTART_ON_CRASH = True           # Auto-restart strategy on crash
 MAX_CRASH_RESTARTS = 3                 # Max restarts before giving up
 
 # Excel Performance Tracking
-EXCEL_LOG_FILE = "optionalpha_performance.xlsx"  # Excel file for trade history
+EXCEL_LOG_FILE = str(Path(__file__).parent / "optionalpha_performance.xlsx")  # Absolute path for consistent location
 
 # =============================================================================
 
