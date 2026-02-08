@@ -155,23 +155,21 @@ class StrategyLogger:
         self.logger.setLevel(logging.DEBUG)
         self.logger.handlers = []  # Clear existing handlers
 
-        # Console handler (only if file logging is disabled)
-        if not log_to_file:
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(logging.INFO)
-            console_format = logging.Formatter(
-                '[%(asctime)s] %(levelname)s: %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
-            console_handler.setFormatter(console_format)
-            self.logger.addHandler(console_handler)
+        # Console handler (always enabled for important messages)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_format = logging.Formatter(
+            '[%(asctime)s] %(levelname)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler.setFormatter(console_format)
+        self.logger.addHandler(console_handler)
 
-        # File handler
+        # File handler (detailed DEBUG logging)
         if log_to_file:
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(
-                log_dir,
-                f"strategy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            log_file = str(
+                Path(log_dir) / f"strategy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
             )
             file_handler = logging.FileHandler(log_file)
             file_handler.setLevel(logging.DEBUG)
@@ -208,12 +206,11 @@ class ConnectionState(Enum):
 # =============================================================================
 
 # OpenAlgo API Key - loaded from central config
-from pathlib import Path
 sys.path.insert(0, str(Path.home() / ".config/openalgo"))
 try:
     from client import API_KEY
 except ImportError:
-    API_KEY = "0a7ea96180c4bffa62c7401005779eccbc3d3a0a26676bcd241f182979d6bd01"  # Fallback - edit ~/.config/openalgo/config.json
+    API_KEY = os.environ.get("OPENALGO_API_KEY", "")
 
 # OpenAlgo Server
 HOST = "http://127.0.0.1:5003"
@@ -226,17 +223,21 @@ INDEX = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
 EXPIRY_WEEK = 1
 
 # Capital & Position Sizing
-CAPITAL_PERCENT = 0.90             # Use 90% of available capital
+CAPITAL_PERCENT = 0.95             # Use 90% of available capital
 
 # Risk Management
 SL_PERCENT = 0.07                  # 5% stop loss below entry level
-TARGET_POINTS = 25                 # Fixed 25-point profit target
+TARGET_POINTS = 30                 # Fixed 25-point profit target
 BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches this
 
 # Trading Limits
 MAX_COMPLETED_TRADES = 2           # Max completed (exited) trades per day
 NO_NEW_ENTRY_TIME = "14:15"            # No new entries after this time
 FORCE_EXIT_TIME = "14:59"              # Force exit all positions at this time
+
+# Capital Cap
+CAPITAL_CAP_THRESHOLD = 250000             # If capital exceeds this, cap it
+CAPITAL_CAP = 200000                       # Cap capital to this amount
 
 # Freeze Quantity (exchange limit per order)
 FREEZE_QTY = 1755                          # NIFTY freeze limit
@@ -589,8 +590,6 @@ def is_trading_day(client: api) -> tuple[bool, str]:
         # FAIL-SAFE: Don't trade if we can't confirm it's a trading day
         return False, "Cannot confirm trading day (API check failed) - not trading to be safe"
 
-    return True, "Trading day"
-
 
 def round_to_tick(price: float, tick_size: float = 0.05) -> float:
     """
@@ -634,43 +633,9 @@ def build_option_symbol(index: str, expiry_date: str, strike: int, option_type: 
     """
     Build option symbol in OpenAlgo format.
     Example: NIFTY28NOV2526000CE
-
-    Note: This is only used for resistance level calculation where we need to
-    build multiple symbols (20+ API calls would be slow). For main entry level
-    calculation, use optionsymbol() API instead.
     """
     return f"{index}{expiry_date}{strike}{option_type}"
 
-
-def get_5min_candle_close(client: api, symbol: str, exchange: str) -> float:
-    """
-    Fetch the first 5-minute candle close (9:15-9:20).
-    Returns: close price
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    df = client.history(
-        symbol=symbol,
-        exchange=exchange,
-        interval="5m",
-        start_date=today,
-        end_date=today
-    )
-
-    if isinstance(df, dict) and df.get("status") == "error":
-        raise Exception(f"Failed to fetch 5min candle: {df.get('message')}")
-
-    if df is None or df.empty:
-        raise Exception(f"No 5min candle data for {symbol}")
-
-    # Get the first candle (9:15-9:20)
-    first_candle = df.iloc[0]
-    return float(first_candle["close"])
-
-
-# REMOVED: Resistance levels calculation not needed in simplified version
-# Original function calculated R1-R6 levels using straddle/strangle pricing
-# Simplified version uses fixed 25-point target with breakeven SL instead
 
 
 def get_15min_candle(client: api, symbol: str, exchange: str) -> dict:
@@ -691,7 +656,7 @@ def get_15min_candle(client: api, symbol: str, exchange: str) -> dict:
     if isinstance(df, dict) and df.get("status") == "error":
         raise Exception(f"Failed to fetch 15min candle: {df.get('message')}")
 
-    if df.empty:
+    if df is None or df.empty:
         raise Exception(f"No 15min candle data for {symbol}")
 
     # Get the first candle (9:15-9:30)
@@ -897,6 +862,8 @@ class OptionsAlphaStrategy:
                 "Final SL": trade_data.get("final_sl", 0.0),
                 "Quantity": trade_data.get("quantity", 0),
                 "PnL": trade_data.get("pnl", 0.0),
+                "PnL %": trade_data.get("pnl_percent", 0.0),
+                "Capital Deployed": trade_data.get("capital_deployed", 0.0),
                 "Exit Reason": trade_data.get("exit_reason", ""),
                 "Breakeven Activated": "Yes" if trade_data.get("breakeven_activated", False) else "No"
             }
@@ -1076,9 +1043,9 @@ class OptionsAlphaStrategy:
 
     def initialize_capital(self):
         """
-        Initialize capital with 2L cap - called once at start.
+        Initialize capital - called once at start.
 
-        If available capital > 2.5L, cap at 2L.
+        If capital exceeds CAPITAL_CAP_THRESHOLD, cap at CAPITAL_CAP.
         Otherwise use configured percentage of available capital.
         """
         result = self.client.funds()
@@ -1086,10 +1053,9 @@ class OptionsAlphaStrategy:
             available = float(result.get("data", {}).get("availablecash", 0))
             capital_with_percent = available * self.config.CAPITAL_PERCENT
 
-            # If capital > 2.5L, cap at 2L
-            if capital_with_percent > 250000:
-                self.allocated_capital = 200000
-                self.log(f"Capital capped: Available ₹{available:,.0f} → Using ₹2,00,000")
+            if capital_with_percent > CAPITAL_CAP_THRESHOLD:
+                self.allocated_capital = CAPITAL_CAP
+                self.log(f"Capital capped: Available ₹{available:,.0f} → Using ₹{CAPITAL_CAP:,.0f}")
             else:
                 self.allocated_capital = capital_with_percent
                 self.log(f"Capital allocated: ₹{self.allocated_capital:,.0f} ({self.config.CAPITAL_PERCENT*100:.0f}% of ₹{available:,.0f})")
@@ -1157,14 +1123,14 @@ class OptionsAlphaStrategy:
             self.logger.debug(f"HTTP LTP for {symbol}: {http_ltp}")
             return http_ltp
 
-        # Last resort: return stale WebSocket data if available
+        # Last resort: return stale WebSocket data if available (already fetched above)
         if self.tick_manager.connected:
             ws_ltp = self.tick_manager.get_ltp(symbol)
             if ws_ltp > 0:
                 self.logger.warning(f"Using stale WebSocket data for {symbol}: {ws_ltp}")
                 return ws_ltp
 
-        self.logger.error(f"Failed to get LTP for {symbol} (both WS and HTTP failed)")
+        self.logger.error(f"All LTP sources failed for {symbol}")
         return 0.0
 
     def verify_order_executed(
@@ -1419,7 +1385,6 @@ class OptionsAlphaStrategy:
 
         current_value = ltp * self.position.quantity
         pnl = current_value - self.position.cost_basis
-        pnl_percent = (pnl / self.position.cost_basis) * 100
         pnl_points = ltp - self.position.entry_price
 
         # Check target hit
@@ -1525,10 +1490,14 @@ class OptionsAlphaStrategy:
         if not order_success:
             self.logger.critical(f"FAILED TO CLOSE POSITION after {max_retries} attempts!")
             self.logger.critical(f"MANUAL INTERVENTION REQUIRED: {symbol} x {quantity}")
+            self.can_trade = False
+            self.running = False
             return False
 
         # Calculate PnL
+        cost_basis = entry_price * quantity
         pnl = (exit_price - entry_price) * quantity
+        pnl_percent = (pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
         self.daily_pnl += pnl
 
         # Record trade
@@ -1547,6 +1516,8 @@ class OptionsAlphaStrategy:
             "final_sl": final_sl,
             "quantity": quantity,
             "pnl": pnl,
+            "pnl_percent": pnl_percent,
+            "capital_deployed": cost_basis,
             "exit_reason": reason,
             "breakeven_activated": breakeven_activated
         }
@@ -1563,7 +1534,8 @@ class OptionsAlphaStrategy:
 
         # Log summary
         pnl_str = f"+₹{pnl:.2f}" if pnl >= 0 else f"₹{pnl:.2f}"
-        self.log(f"✓ EXIT @ {exit_price:.2f} | PnL: {pnl_str} | Trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
+        pnl_pct_str = f"+{pnl_percent:.2f}%" if pnl_percent >= 0 else f"{pnl_percent:.2f}%"
+        self.log(f"✓ EXIT @ {exit_price:.2f} | PnL: {pnl_str} ({pnl_pct_str}) | Deployed: ₹{cost_basis:,.0f} | Trades: {self.completed_trades}/{self.config.MAX_COMPLETED_TRADES}")
 
         # Check if max trades reached - stop new entries
         if self.completed_trades >= self.config.MAX_COMPLETED_TRADES:
@@ -1634,7 +1606,8 @@ class OptionsAlphaStrategy:
                 self.log(f"  Exit Time   : {trade['exit_time']} @ ₹{trade['exit_price']:.2f}")
                 self.log(f"  Final SL    : ₹{trade['final_sl']:.2f}{be_flag}")
                 self.log(f"  Quantity    : {trade['quantity']}")
-                self.log(f"  PnL         : {pnl_sign}₹{trade['pnl']:.2f}")
+                self.log(f"  Deployed    : ₹{trade.get('capital_deployed', 0):,.0f}")
+                self.log(f"  PnL         : {pnl_sign}₹{trade['pnl']:.2f} ({pnl_sign}{trade.get('pnl_percent', 0):.2f}%)")
 
         self.log("=" * 70)
 
