@@ -226,7 +226,7 @@ EXPIRY_WEEK = 1
 CAPITAL_PERCENT = 0.95             # Use 90% of available capital
 
 # Risk Management
-SL_PERCENT = 0.07                  # 5% stop loss below entry level
+SL_PERCENT = 0.08                  # 5% stop loss below entry level
 TARGET_POINTS = 30                 # Fixed 25-point profit target
 BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches this
 
@@ -236,8 +236,8 @@ NO_NEW_ENTRY_TIME = "14:15"            # No new entries after this time
 FORCE_EXIT_TIME = "14:59"              # Force exit all positions at this time
 
 # Capital Cap
-CAPITAL_CAP_THRESHOLD = 250000             # If capital exceeds this, cap it
-CAPITAL_CAP = 200000                       # Cap capital to this amount
+CAPITAL_CAP_THRESHOLD = 525000             # If capital exceeds this, cap it
+CAPITAL_CAP = 500000                       # Cap capital to this amount
 
 # Freeze Quantity (exchange limit per order)
 FREEZE_QTY = 1755                          # NIFTY freeze limit
@@ -765,9 +765,9 @@ class OptionsAlphaStrategy:
         self.trades_dict: dict = {}          # Key: order_id, Value: complete trade info
         self.subscribed_symbols: List[dict] = []
 
-        # 1-min candle cache (fetched from API, refreshed each minute)
+        # 1-min candle cache (fetched from API, refreshed every 5 seconds)
         self._candle_cache: Dict[str, "pd.DataFrame"] = {}
-        self._candle_cache_minute: int = -1
+        self._candle_cache_time: float = 0.0
         self.allocated_capital: float = 0.0  # Capital allocated for trading (capped at 2L)
 
         # Crash recovery state
@@ -780,15 +780,16 @@ class OptionsAlphaStrategy:
 
     def get_1m_candles(self, symbol: str) -> "pd.DataFrame":
         """
-        Get 1-min candles from history API with per-minute caching.
-        Returns cached data if already fetched this minute.
+        Get 1-min candles from history API with 5-second TTL cache.
+        Avoids stale data from minute-boundary fetches where the broker
+        API hasn't yet finalized the previous candle.
         """
-        current_minute = datetime.now().minute
+        now = time.time()
 
-        if current_minute != self._candle_cache_minute:
-            # New minute — refresh cache for all symbols
+        if now - self._candle_cache_time >= 5:
+            # Cache expired — clear for fresh fetch
             self._candle_cache.clear()
-            self._candle_cache_minute = current_minute
+            self._candle_cache_time = now
 
         if symbol in self._candle_cache:
             return self._candle_cache[symbol]
