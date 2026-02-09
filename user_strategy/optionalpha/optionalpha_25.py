@@ -624,6 +624,12 @@ def get_expiry_date(client: api, index: str, exchange: str, expiry_week: int) ->
 
     # expiry_dates are sorted, pick based on expiry_week
     idx = min(expiry_week - 1, len(expiry_dates) - 1)
+
+    # Skip expiry day — if nearest expiry is today, use next week's
+    today_str = datetime.now().strftime("%d-%b-%y").upper()  # e.g., 10-FEB-26
+    if expiry_dates[idx].upper() == today_str and len(expiry_dates) > idx + 1:
+        idx += 1
+
     # Expiry API returns DD-MMM-YY (e.g., 10-FEB-26) but optionsymbol API
     # expects DDMMMYY (e.g., 10FEB26) — strip hyphens
     return expiry_dates[idx].replace("-", "")
