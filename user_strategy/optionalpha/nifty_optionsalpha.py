@@ -669,6 +669,12 @@ def get_expiry_date(client: api, index: str, exchange: str, expiry_week: int) ->
 
     # expiry_dates are sorted, pick based on expiry_week
     idx = min(expiry_week - 1, len(expiry_dates) - 1)
+
+    # Skip expiry day — if nearest expiry is today, use next week's
+    today_str = datetime.now().strftime("%d-%b-%y").upper()  # e.g., 10-FEB-26
+    if expiry_dates[idx].upper() == today_str and len(expiry_dates) > idx + 1:
+        idx += 1
+
     # Expiry API returns DD-MMM-YY (e.g., 10-FEB-26) but optionsymbol API
     # expects DDMMMYY (e.g., 10FEB26) — strip hyphens
     return expiry_dates[idx].replace("-", "")
@@ -950,9 +956,9 @@ class OptionsAlphaStrategy:
         self.trades_dict: dict = {}          # Key: entry_order_id, Value: complete trade info
         self.subscribed_symbols: List[dict] = []
 
-        # 1-min candle cache (fetched from API, refreshed each minute)
+        # 1-min candle cache (fetched from API, refreshed every 5 seconds)
         self._candle_cache: Dict[str, "pd.DataFrame"] = {}
-        self._candle_cache_minute: int = -1
+        self._candle_cache_time: float = 0.0
 
         # Crash recovery state
         self.crash_count: int = 0
@@ -964,15 +970,16 @@ class OptionsAlphaStrategy:
 
     def get_1m_candles(self, symbol: str) -> "pd.DataFrame":
         """
-        Get 1-min candles from history API with per-minute caching.
-        Returns cached data if already fetched this minute.
+        Get 1-min candles from history API with 5-second TTL cache.
+        Avoids stale data from minute-boundary fetches where the broker
+        API hasn't yet finalized the previous candle.
         """
-        current_minute = datetime.now().minute
+        now = time.time()
 
-        if current_minute != self._candle_cache_minute:
-            # New minute — refresh cache for all symbols
+        if now - self._candle_cache_time >= 5:
+            # Cache expired — clear for fresh fetch
             self._candle_cache.clear()
-            self._candle_cache_minute = current_minute
+            self._candle_cache_time = now
 
         if symbol in self._candle_cache:
             return self._candle_cache[symbol]
