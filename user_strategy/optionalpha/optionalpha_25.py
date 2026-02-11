@@ -622,13 +622,23 @@ def get_expiry_date(client: api, index: str, exchange: str, expiry_week: int) ->
     if not expiry_dates:
         raise Exception("No expiry dates available")
 
-    # expiry_dates are sorted, pick based on expiry_week
-    idx = min(expiry_week - 1, len(expiry_dates) - 1)
+    # Skip past and today's expiries (contracts already expired or expiring today)
+    today = datetime.now().date()
+    while expiry_dates:
+        try:
+            exp_date = datetime.strptime(expiry_dates[0], "%d-%b-%y").date()
+        except ValueError:
+            exp_date = datetime.strptime(expiry_dates[0], "%d-%B-%y").date()
+        if exp_date <= today:
+            expiry_dates.pop(0)
+        else:
+            break
 
-    # Skip expiry day — if nearest expiry is today, use next week's
-    today_str = datetime.now().strftime("%d-%b-%y").upper()  # e.g., 10-FEB-26
-    if expiry_dates[idx].upper() == today_str and len(expiry_dates) > idx + 1:
-        idx += 1
+    if not expiry_dates:
+        raise Exception("No future expiry dates available")
+
+    # Pick based on expiry_week (1 = nearest future, 2 = next week, etc.)
+    idx = min(expiry_week - 1, len(expiry_dates) - 1)
 
     # Expiry API returns DD-MMM-YY (e.g., 10-FEB-26) but optionsymbol API
     # expects DDMMMYY (e.g., 10FEB26) — strip hyphens
@@ -644,35 +654,40 @@ def build_option_symbol(index: str, expiry_date: str, strike: int, option_type: 
 
 
 
-def get_15min_candle(client: api, symbol: str, exchange: str) -> dict:
+def get_15min_candle(client: api, symbol: str, exchange: str, max_retries: int = 3, delay: int = 5) -> dict:
     """
     Fetch the first 15-minute candle (9:15-9:30).
+    Retries with delay since candle data may not be available immediately after 9:30.
     Returns: {open, high, low, close}
     """
     today = datetime.now().strftime("%Y-%m-%d")
 
-    df = client.history(
-        symbol=symbol,
-        exchange=exchange,
-        interval="15m",
-        start_date=today,
-        end_date=today
-    )
+    for attempt in range(max_retries):
+        df = client.history(
+            symbol=symbol,
+            exchange=exchange,
+            interval="15m",
+            start_date=today,
+            end_date=today
+        )
 
-    if isinstance(df, dict) and df.get("status") == "error":
-        raise Exception(f"Failed to fetch 15min candle: {df.get('message')}")
+        # Success — got a DataFrame with data
+        if hasattr(df, 'empty') and not df.empty:
+            first_candle = df.iloc[0]
+            return {
+                "open": float(first_candle["open"]),
+                "high": float(first_candle["high"]),
+                "low": float(first_candle["low"]),
+                "close": float(first_candle["close"])
+            }
 
-    if df is None or df.empty:
-        raise Exception(f"No 15min candle data for {symbol}")
+        # Not ready yet — retry
+        msg = df.get('message', 'empty') if isinstance(df, dict) else 'empty'
+        if attempt < max_retries - 1:
+            logging.warning(f"15m candle not ready for {symbol} (attempt {attempt + 1}/{max_retries}): {msg}, retrying in {delay}s...")
+            time.sleep(delay)
 
-    # Get the first candle (9:15-9:30)
-    first_candle = df.iloc[0]
-    return {
-        "open": float(first_candle["open"]),
-        "high": float(first_candle["high"]),
-        "low": float(first_candle["low"]),
-        "close": float(first_candle["close"])
-    }
+    raise Exception(f"Failed to fetch 15min candle for {symbol} after {max_retries} attempts")
 
 
 def calculate_quantity(capital: float, price: float, lot_size: int) -> int:
@@ -961,7 +976,7 @@ class OptionsAlphaStrategy:
 
             time.sleep(5)
 
-        time.sleep(10)
+        time.sleep(20)
         self.log("9:30 candle closed")
 
     def calculate_entry_levels(self) -> EntryLevels:
