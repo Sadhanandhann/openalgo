@@ -22,12 +22,12 @@ CORE CONCEPTS:
    - Confirmation: Current 1min candle open AND close above entry level
    - Crossover: Previous 1min candle open OR close below entry level
 
-3. **Fixed Target & Breakeven Stop Loss**:
-   - Initial SL: 5% below entry level
-   - Target: Entry price + 25 points (fixed)
-   - Trailing Logic: When profit reaches 20 points, move SL to cost (breakeven)
-   - SL only moves UP to breakeven, never down
-   - Simple and predictable profit protection
+3. **Fixed Target & Stepped Trailing Stop Loss**:
+   - Initial SL: 8% below entry level
+   - Target: Entry price + 30 points (fixed)
+   - Step 1: When profit reaches 20 points, move SL to cost (breakeven)
+   - Step 2: When profit reaches 25 points, move SL to entry + 10 (lock profit)
+   - SL only moves UP, never down
 
 TIMING & SCHEDULE:
 ------------------
@@ -42,8 +42,10 @@ RISK MANAGEMENT:
 ----------------
 - Capital: 80% of available funds per trade
 - Max Trades: 2 completed trades per day (default)
-- Stop Loss: 5% below entry level initially, moves to cost when profit reaches 20 points
-- Target: Entry price + 25 points (fixed)
+- Stop Loss: 8% below entry level initially
+- At +20 pts profit: SL moves to cost (breakeven)
+- At +25 pts profit: SL moves to entry + 10 (lock profit)
+- Target: Entry price + 30 points (fixed)
 - Position Sizing: Calculated based on capital and lot size
 - Only one position at a time (CE or PE, whichever breaks out first)
 
@@ -75,21 +77,25 @@ EXAMPLE TRADE FLOW:
   - Current 1min candle: Open=153, Close=154 (both > 152.50) ✓
   - Previous 1min candle: Open=151, Close=152 (at least one < 152.50) ✓
   - Entry confirmed! Buy PE @ 154.00
-  - Initial SL: 152.50 × 0.95 = 144.88
-  - Target: 154.00 + 25 = 179.00
+  - Initial SL: 152.50 × 0.92 = 140.30
+  - Target: 154.00 + 30 = 184.00
 
 10:05 AM:
   - PE LTP reaches 174.00
   - Profit: 174.00 - 154.00 = 20 points ✓
   - SL moves to COST: 154.00 (breakeven protection activated)
-  - Target still: 179.00
+
+10:12 AM:
+  - PE LTP reaches 179.00
+  - Profit: 179.00 - 154.00 = 25 points ✓
+  - SL moves to 164.00 (entry + 10, locking 10 pts profit)
 
 10:20 AM:
-  - PE LTP reaches 179.50
-  - Target hit at 179.00
-  - Exit @ 179.00
-  - PnL: (179.00 - 154.00) × qty = 25 points × qty
-  - Trade closed with full 25-point profit!
+  - PE LTP reaches 184.50
+  - Target hit at 184.00
+  - Exit @ 184.00
+  - PnL: (184.00 - 154.00) × qty = 30 points × qty
+  - Trade closed with full 30-point profit!
 
 CONFIGURATION OPTIONS:
 ----------------------
@@ -98,9 +104,11 @@ Edit these constants at the top of the file:
 INDEX = "NIFTY"                    # NIFTY, BANKNIFTY, SENSEX
 EXPIRY_WEEK = 1                    # 1=current, 2=next week
 CAPITAL_PERCENT = 0.80             # Use 80% of available capital
-SL_PERCENT = 0.05                  # 5% initial stop loss
-TARGET_POINTS = 25                 # Fixed 25-point profit target
+SL_PERCENT = 0.08                  # 8% initial stop loss
+TARGET_POINTS = 30                 # Fixed 30-point profit target
 BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches 20 points
+LOCK_PROFIT_POINTS = 25            # When profit reaches 25 pts, lock SL to entry + 10
+LOCK_PROFIT_SL = 10                # SL moves to entry + 10 points
 MAX_COMPLETED_TRADES = 2           # Max trades per day
 NO_NEW_ENTRY_TIME = "14:15"        # Last entry time
 FORCE_EXIT_TIME = "14:59"          # Square off time
@@ -229,6 +237,8 @@ CAPITAL_PERCENT = 0.95             # Use 90% of available capital
 SL_PERCENT = 0.08                  # 5% stop loss below entry level
 TARGET_POINTS = 30                 # Fixed 25-point profit target
 BREAKEVEN_POINTS = 20              # Move SL to cost when profit reaches this
+LOCK_PROFIT_POINTS = 25            # When profit reaches this, lock SL to LOCK_PROFIT_SL
+LOCK_PROFIT_SL = 10                # SL moves to entry + this many points
 
 # Trading Limits
 MAX_COMPLETED_TRADES = 2           # Max completed (exited) trades per day
@@ -277,6 +287,8 @@ class Config:
     SL_PERCENT: float = SL_PERCENT
     TARGET_POINTS: float = TARGET_POINTS
     BREAKEVEN_POINTS: float = BREAKEVEN_POINTS
+    LOCK_PROFIT_POINTS: float = LOCK_PROFIT_POINTS
+    LOCK_PROFIT_SL: float = LOCK_PROFIT_SL
     MAX_COMPLETED_TRADES: int = MAX_COMPLETED_TRADES
 
     # Timing (IST) - usually don't need to change
@@ -1427,6 +1439,14 @@ class OptionsAlphaStrategy:
                 self.position.sl_price = new_sl
                 self.position.breakeven_activated = True
                 self.log(f"⚡ BREAKEVEN @ +{pnl_points:.1f}pts | SL→{new_sl:.2f}")
+
+        # Lock profit: move SL to entry + LOCK_PROFIT_SL when profit reaches LOCK_PROFIT_POINTS
+        if self.position.breakeven_activated and pnl_points >= self.config.LOCK_PROFIT_POINTS:
+            lock_sl = round_to_tick(self.position.entry_price + self.config.LOCK_PROFIT_SL)
+
+            if lock_sl > self.position.sl_price:
+                self.position.sl_price = lock_sl
+                self.log(f"🔒 LOCK PROFIT @ +{pnl_points:.1f}pts | SL→{lock_sl:.2f} (+{self.config.LOCK_PROFIT_SL:.0f}pts)")
 
         return False
 
