@@ -5,15 +5,19 @@ Options Alpha 25 - Simplified Version (WebSocket)
 
 STRATEGY OVERVIEW:
 ------------------
-A simplified momentum-based options buying strategy that trades ATM options
-using a fixed 25-point target with breakeven trailing stop loss. The strategy
-captures directional moves in the first hour of trading with simple profit
-protection logic.
+A momentum-based options buying strategy that uses synthetic futures to
+determine the ATM strike, with a fixed 30-point target and stepped trailing
+stop loss. The strategy captures directional moves in the first hour of
+trading with breakeven and lock-profit protection.
 
 CORE CONCEPTS:
 --------------
-1. **Simple Timeframe Approach**:
-   - 15-min candle (9:15-9:30): Determine ATM strike and entry levels
+1. **Synthetic Future ATM Calculation**:
+   - 15-min candle (9:15-9:30): Fetch CE/PE candles at preliminary ATM (from spot)
+   - Syn Fut High = Strike + CE_High - PE_Low
+   - Syn Fut Low  = Strike + CE_Low  - PE_High
+   - Final ATM = round(Average(Syn Fut High, Syn Fut Low) / strike_interval) × strike_interval
+   - If ATM shifts from spot-based ATM, re-fetch CE/PE candles at the new strike
 
 2. **Entry Logic**:
    - Waits for price to break above entry level with confirmation
@@ -32,7 +36,7 @@ CORE CONCEPTS:
 TIMING & SCHEDULE:
 ------------------
 09:15 - Market opens
-09:30 - First 15-min candle closes → Calculate ATM strike & entry levels
+09:30 - First 15-min candle closes → Calculate synthetic future → ATM strike & entry levels
 09:31 - Strategy starts monitoring for entry conditions
 14:15 - No new entries allowed after this time
 15:00 - Force exit all positions
@@ -64,11 +68,15 @@ EXAMPLE TRADE FLOW:
 -------------------
 09:30 AM:
   - NIFTY 15min close: 22,510
-  - ATM Strike: 22,500 (auto-calculated via optionsymbol API)
-  - PE Symbol: NIFTY10FEB2622500PE
-  - CE Symbol: NIFTY10FEB2622500CE
-  - PE 15min: Low=140, High=160
-  - CE 15min: Low=145, High=165
+  - Preliminary ATM (from spot): 22,500
+  - Fetch CE/PE 15min candles at 22,500 strike:
+    - CE 15min: Low=145, High=165
+    - PE 15min: Low=140, High=160
+  - Synthetic Future:
+    - High = 22500 + 165 - 140 = 22,525
+    - Low  = 22500 + 145 - 160 = 22,485
+    - Avg  = (22525 + 22485) / 2 = 22,505
+  - Final ATM: round(22505 / 50) × 50 = 22,500 (no shift)
   - PE Entry Level: (140 + 165) / 2 = 152.50
   - CE Entry Level: (145 + 165) / 2 = 155.00
 
@@ -131,8 +139,8 @@ LOGS:
 - File: logs/strategy_YYYYMMDD_HHMMSS.log (if LOG_TO_FILE=True)
 
 Author: Generated with Claude
-Version: 25.0 (Simplified)
-Last Updated: 2026-02-05
+Version: 25.1 (Synthetic Future ATM + Lock Profit)
+Last Updated: 2026-02-12
 Base: Options Alpha Strategy v3.0
 """
 
@@ -992,7 +1000,7 @@ class OptionsAlphaStrategy:
         self.log("9:30 candle closed")
 
     def calculate_entry_levels(self) -> EntryLevels:
-        """Calculate ATM strike and entry levels using 9:30 candle close (static for the day)"""
+        """Calculate ATM strike via synthetic future and entry levels from 9:30 candle (static for the day)"""
         # Get expiry date
         expiry_date = get_expiry_date(
             self.client,
@@ -1001,7 +1009,7 @@ class OptionsAlphaStrategy:
             self.config.EXPIRY_WEEK
         )
 
-        # Get index first 15-min candle to determine ATM from 9:30 close (not live price)
+        # Step 1: Preliminary ATM from spot at 9:30
         today = datetime.now().strftime("%Y-%m-%d")
         index_df = self.client.history(
             symbol=self.config.INDEX,
@@ -1016,11 +1024,37 @@ class OptionsAlphaStrategy:
             raise Exception("No index 15m candle data")
 
         spot_at_930 = float(index_df.iloc[0]["close"])
-        atm_strike = round(spot_at_930 / self.strike_interval) * self.strike_interval
+        prelim_atm = round(spot_at_930 / self.strike_interval) * self.strike_interval
 
-        # Build symbols from fixed 9:30 ATM strike
-        pe_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "PE")
-        ce_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "CE")
+        # Step 2: Fetch 15-min candles for CE/PE at preliminary ATM
+        prelim_ce = build_option_symbol(self.config.INDEX, expiry_date, prelim_atm, "CE")
+        prelim_pe = build_option_symbol(self.config.INDEX, expiry_date, prelim_atm, "PE")
+        ce_candle = get_15min_candle(self.client, prelim_ce, self.options_exchange)
+        pe_candle = get_15min_candle(self.client, prelim_pe, self.options_exchange)
+
+        # Step 3: Calculate synthetic future range
+        # Syn Fut High = Strike + CE_High - PE_Low (CE strongest, PE weakest)
+        # Syn Fut Low  = Strike + CE_Low  - PE_High (CE weakest, PE strongest)
+        syn_fut_high = prelim_atm + ce_candle["high"] - pe_candle["low"]
+        syn_fut_low = prelim_atm + ce_candle["low"] - pe_candle["high"]
+        avg_syn_fut = (syn_fut_high + syn_fut_low) / 2
+
+        # Step 4: Final ATM from synthetic future
+        atm_strike = round(avg_syn_fut / self.strike_interval) * self.strike_interval
+
+        self.log(f"Synthetic Future: High={syn_fut_high:.2f} Low={syn_fut_low:.2f} Avg={avg_syn_fut:.2f}")
+        self.log(f"ATM: {prelim_atm} (spot) → {atm_strike} (syn fut)")
+
+        # Step 5: If ATM shifted, re-fetch CE/PE candles at the new strike
+        if atm_strike != prelim_atm:
+            self.log(f"ATM shifted by {atm_strike - prelim_atm:+d}, re-fetching candles")
+            ce_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "CE")
+            pe_symbol = build_option_symbol(self.config.INDEX, expiry_date, atm_strike, "PE")
+            ce_candle = get_15min_candle(self.client, ce_symbol, self.options_exchange)
+            pe_candle = get_15min_candle(self.client, pe_symbol, self.options_exchange)
+        else:
+            ce_symbol = prelim_ce
+            pe_symbol = prelim_pe
 
         # Get lot size from optionsymbol API
         pe_result = self.client.optionsymbol(
@@ -1032,15 +1066,11 @@ class OptionsAlphaStrategy:
         )
         lot_size = pe_result.get("lotsize", INDEX_CONFIG.get(self.config.INDEX, {}).get("lot_size", 1))
 
-        # Get first 15-min candle for PE and CE
-        pe_candle = get_15min_candle(self.client, pe_symbol, self.options_exchange)
-        ce_candle = get_15min_candle(self.client, ce_symbol, self.options_exchange)
-
         # Calculate entry levels
         pe_entry_level = (pe_candle["low"] + ce_candle["high"]) / 2
         ce_entry_level = (ce_candle["low"] + pe_candle["high"]) / 2
 
-        self.log(f"Setup: {expiry_date} | ATM: {atm_strike} (9:30 close: {spot_at_930:.2f})")
+        self.log(f"Setup: {expiry_date} | ATM: {atm_strike} (spot: {spot_at_930:.2f}, syn fut: {avg_syn_fut:.2f})")
         self.log(f"Symbols → PE: {pe_symbol} | CE: {ce_symbol}")
         self.log(f"Entry Levels → PE: {pe_entry_level:.2f} | CE: {ce_entry_level:.2f}")
 
