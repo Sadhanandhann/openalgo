@@ -221,14 +221,8 @@ class ConnectionState(Enum):
 # USER CONFIGURATION - EDIT THESE VALUES
 # =============================================================================
 
-# OpenAlgo API Key - loaded from central config (Fyers broker)
-sys.path.insert(0, str(Path.home() / ".config/openalgo"))
-try:
-    from client import get_config
-    _fyers_cfg = get_config("fyers")
-    API_KEY = _fyers_cfg["api_key"]
-except ImportError:
-    API_KEY = os.environ.get("OPENALGO_API_KEY", "")
+# OpenAlgo API Key (Fyers instance)
+API_KEY = "1b523a5e29f80e230ce49bcd1491f08ae78f0fbbc40ca9cdf2049ec8526c3b18"
 
 # OpenAlgo Server (Fyers instance)
 HOST = "http://127.0.0.1:5002"
