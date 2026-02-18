@@ -14,7 +14,7 @@ client = api(
     host="http://127.0.0.1:5000",
 )
 
-NIFTY_LOT = 75  # NSE Index lot size
+NIFTY_LOT = 65  # NSE Index lot size
 LOTS = 1  # Number of lots
 
 

@@ -33,7 +33,7 @@ class WebSocketProxy:
     Supports dynamic broker selection based on user configuration.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8767):
         """
         Initialize the WebSocket Proxy
 
