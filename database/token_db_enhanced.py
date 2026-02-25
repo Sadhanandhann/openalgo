@@ -1039,7 +1039,9 @@ def get_distinct_expiries_cached(
             for exp_set in cache.expiries_by_exchange.values():
                 expiries.update(exp_set)
 
-        # Sort expiries chronologically
+        # Sort expiries chronologically and filter out past dates
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
         def parse_expiry(exp_str):
             try:
                 return datetime.strptime(exp_str, "%d-%b-%y")
@@ -1049,7 +1051,10 @@ def get_distinct_expiries_cached(
                 except ValueError:
                     return datetime.max
 
-        return sorted(list(expiries), key=parse_expiry)
+        return [
+            exp for exp in sorted(list(expiries), key=parse_expiry)
+            if parse_expiry(exp) >= today
+        ]
 
     # Fallback to database
     try:
