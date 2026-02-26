@@ -94,6 +94,8 @@ class TrafficLog(LogBase):
             logger.exception(f"Error logging traffic: {str(e)}")
             logs_session.rollback()
             return False
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def get_recent_logs(limit=100):
@@ -103,6 +105,8 @@ class TrafficLog(LogBase):
         except Exception as e:
             logger.exception(f"Error getting recent logs: {str(e)}")
             return []
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def get_stats():
@@ -122,6 +126,8 @@ class TrafficLog(LogBase):
         except Exception as e:
             logger.exception(f"Error getting traffic stats: {str(e)}")
             return {"total_requests": 0, "error_requests": 0, "avg_duration": 0}
+        finally:
+            logs_session.remove()
 
 
 class IPBan(LogBase):
@@ -165,6 +171,8 @@ class IPBan(LogBase):
             logger.exception(f"Error checking IP ban status: {e}")
             logs_session.rollback()
             return False
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def ban_ip(ip_address, reason, duration_hours=24, permanent=False, created_by="system"):
@@ -219,6 +227,8 @@ class IPBan(LogBase):
             logger.exception(f"Error banning IP {ip_address}: {e}")
             logs_session.rollback()
             return False
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def unban_ip(ip_address):
@@ -235,6 +245,8 @@ class IPBan(LogBase):
             logger.exception(f"Error unbanning IP: {e}")
             logs_session.rollback()
             return False
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def get_all_bans():
@@ -255,6 +267,8 @@ class IPBan(LogBase):
         except Exception as e:
             logger.exception(f"Error getting IP bans: {e}")
             return []
+        finally:
+            logs_session.remove()
 
 
 class Error404Tracker(LogBase):
@@ -339,6 +353,8 @@ class Error404Tracker(LogBase):
             logger.exception(f"Error tracking 404: {e}")
             logs_session.rollback()
             return False
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def get_suspicious_ips(min_errors=5):
@@ -364,6 +380,8 @@ class Error404Tracker(LogBase):
         except Exception as e:
             logger.exception(f"Error getting suspicious IPs: {e}")
             return []
+        finally:
+            logs_session.remove()
 
 
 class InvalidAPIKeyTracker(LogBase):
@@ -458,6 +476,8 @@ class InvalidAPIKeyTracker(LogBase):
             logger.exception(f"Error tracking invalid API key: {e}")
             logs_session.rollback()
             return False
+        finally:
+            logs_session.remove()
 
     @staticmethod
     def get_suspicious_api_users(min_attempts=3):
@@ -485,6 +505,8 @@ class InvalidAPIKeyTracker(LogBase):
         except Exception as e:
             logger.exception(f"Error getting suspicious API users: {e}")
             return []
+        finally:
+            logs_session.remove()
 
 
 def init_logs_db():
